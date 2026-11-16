@@ -1,4 +1,7 @@
 import { lookup } from 'node:dns/promises'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { DEFAULT_MAX_LINES } from '@earendil-works/pi-coding-agent'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setCompleteBackend } from '../extensions/internal/model-complete.ts'
@@ -51,13 +54,19 @@ const publicAddresses = [{ address: '93.184.216.34', family: 4 }]
 
 const requestUrls = (): string[] => fetchMock.mock.calls.map((call) => String(call[0]))
 
+// Isolate from the machine's own pi settings (webSearch/webFetch would change both tools).
+const emptyAgentDir = mkdtempSync(path.join(tmpdir(), 'pi-code-web-'))
+
 beforeEach(() => {
+  vi.stubEnv('PI_CODING_AGENT_DIR', emptyAgentDir)
+  vi.stubEnv('SEARXNG_URL', '')
   fetchMock.mockReset()
   lookupMock.mockReset()
   lookupMock.mockResolvedValue(publicAddresses as never)
 })
 
 afterEach(() => {
+  vi.unstubAllEnvs()
   vi.restoreAllMocks()
   setCompleteBackend(null)
 })
