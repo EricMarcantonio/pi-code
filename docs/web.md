@@ -7,6 +7,26 @@ Key-free web tools. Source: [`extensions/web.ts`](../extensions/web.ts).
 - WebFetch reads up to 10 MiB and converts the whole page before capping the output at 30,000 characters, so content that sits behind hundreds of KB of markup (a GitHub pull request's conversation) is reached. A larger response is refused with an error rather than cut, since a cut inside a `<script>` or `<style>` leaks its contents as text.
 - An optional `prompt` runs the page through the model in-process and returns the answer, falling back to markdown when headless or on error.
 
+## SearXNG and settings
+
+pi's user `settings.json` (in the agent dir) can change both tools:
+
+```json
+{
+  "webSearch": {
+    "searxngUrl": "http://127.0.0.1:8888",
+    "startCommand": "docker compose -f services/compose.yml up -d searxng"
+  },
+  "webFetch": { "prompt": false }
+}
+```
+
+- `webSearch.searxngUrl` (or the `SEARXNG_URL` environment variable, which wins) sends `web_search` to SearXNG's JSON API instead of DuckDuckGo. The instance needs `json` under `search.formats`. The URL is your own configuration, so it skips `web_fetch`'s private-address guard; that is what lets it be `127.0.0.1`.
+- `webSearch.startCommand` runs from the agent dir, detached, when SearXNG doesn't answer: once as the session loads if a health check fails, and again from `web_search`, at most once a minute. The search that finds it down returns a message telling the model to retry in about 30 seconds; there is no fallback to DuckDuckGo.
+- `webFetch.prompt: false` removes the `prompt` parameter from `web_fetch`, so the tools never spend model tokens: the model always gets the page as markdown.
+
+Only the user settings file is read. A project's settings can't set these, because a start command runs a shell.
+
 ## Aligned with Claude
 
 - **http is upgraded to https** before the request, as Claude documents. The upgraded URL is also the cache key, so both spellings of a page share one entry.
