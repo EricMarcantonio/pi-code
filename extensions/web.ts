@@ -4,13 +4,22 @@
  * Key-free web access: web_search scrapes the DuckDuckGo HTML endpoint (no
  * API key, no account) and web_fetch retrieves a URL as readable text.
  * Honors the local-only setup: no cloud accounts, plain HTTPS to public web.
+ *
+ * pi's settings.json can point web_search at a SearXNG instance instead
+ * (`webSearch.searxngUrl`, or SEARXNG_URL), with a `webSearch.startCommand` that
+ * starts it in the background when it is down. `webFetch.prompt: false` drops
+ * web_fetch's model-summarized mode, so no web tool spends model tokens.
  */
+
+import { spawn } from 'node:child_process'
 
 import type { LookupAddress } from 'node:dns'
 import { lookup } from 'node:dns/promises'
+import { readFileSync } from 'node:fs'
 import type { LookupFunction } from 'node:net'
+import path from 'node:path'
 import type { Usage } from '@earendil-works/pi-ai'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import { type ExtensionAPI, getAgentDir } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 
 import { htmlToMarkdown, removeTags } from './internal/html-markdown.ts'
@@ -33,6 +42,10 @@ const FETCH_LIMIT: BodyLimit = { maxBytes: 10 * 1024 * 1024, overflow: 'refuse' 
 // The results page is ~35k; a small cut bounds the result regexes' worst case.
 const SEARCH_LIMIT: BodyLimit = { maxBytes: 200_000, overflow: 'cut' }
 const FETCH_TIMEOUT_MS = 20_000
+const SEARXNG_TIMEOUT_MS = 15_000
+const SEARXNG_PROBE_TIMEOUT_MS = 3_000
+// A start command is rerun at most this often, so a burst of searches starts it once.
+const SEARXNG_RESTART_INTERVAL_MS = 60_000
 
 export interface SearchResult {
   title: string
@@ -371,12 +384,136 @@ function pageBody(text: string, contentType: string): string {
   return capFetchChars(contentType.includes('html') ? htmlToMarkdown(text) : text)
 }
 
+export interface WebSettings {
+  /** SearXNG base URL; web_search uses DuckDuckGo when unset. */
+  searxngUrl?: string
+  /** Shell command, run from the agent dir, that starts SearXNG in the background. */
+  startCommand?: string
+  /** Whether web_fetch offers its model-summarized `prompt` mode. */
+  fetchPrompt: boolean
+}
+
+/** The `webSearch` and `webFetch` keys of pi's user settings.json. SEARXNG_URL overrides the URL. */
+export function readWebSettings(agentDir: string = getAgentDir(), env: NodeJS.ProcessEnv = process.env): WebSettings {
+  let raw: { webSearch?: { searxngUrl?: unknown; startCommand?: unknown }; webFetch?: { prompt?: unknown } } = {}
+  try {
+    raw = JSON.parse(readFileSync(path.join(agentDir, 'settings.json'), 'utf8')) ?? {}
+  } catch {
+    // No settings file, or an unreadable one: keep the defaults.
+  }
+  const text = (value: unknown): string | undefined => (typeof value === 'string' && value.trim() ? value.trim() : undefined)
+  return {
+    searxngUrl: text(env.SEARXNG_URL) ?? text(raw.webSearch?.searxngUrl),
+    startCommand: text(raw.webSearch?.startCommand),
+    fetchPrompt: raw.webFetch?.prompt !== false,
+  }
+}
+
+/** Results from SearXNG's JSON API (`/search?format=json`), http(s) URLs only. */
+export function parseSearxngResults(json: unknown, limit: number): SearchResult[] {
+  const results = (json as { results?: unknown } | null)?.results
+  if (!Array.isArray(results)) return []
+  const parsed: SearchResult[] = []
+  for (const entry of results) {
+    const { title, url, content } = (entry ?? {}) as Record<string, unknown>
+    if (typeof url !== 'string' || !/^https?:\/\//.test(url)) continue
+    parsed.push({ title: typeof title === 'string' && title ? title : url, url, snippet: typeof content === 'string' ? content : '' })
+    if (parsed.length >= limit) break
+  }
+  return parsed
+}
+
+type SearxngOutcome = { kind: 'results'; results: SearchResult[] } | { kind: 'down'; reason: string } | { kind: 'error'; reason: string }
+
+function searxngEndpoint(base: string, route: string): URL {
+  return new URL(route, base.endsWith('/') ? base : `${base}/`)
+}
+
+/**
+ * One SearXNG query. The URL is the user's own configuration, typically localhost, so it
+ * deliberately skips web_fetch's private-address guard. A refused connection is `down`
+ * (worth starting the service); any other failure is an `error` to report.
+ */
+async function searchSearxng(base: string, query: string, signal?: AbortSignal): Promise<SearxngOutcome> {
+  const url = searxngEndpoint(base, 'search')
+  url.searchParams.set('q', query)
+  url.searchParams.set('format', 'json')
+  const timeout = AbortSignal.timeout(SEARXNG_TIMEOUT_MS)
+  let response: Response
+  try {
+    response = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout, headers: { accept: 'application/json' } })
+  } catch (error) {
+    if (signal?.aborted) throw error
+    return { kind: 'down', reason: error instanceof Error ? error.message : String(error) }
+  }
+  if (response.status === 403) return { kind: 'error', reason: 'HTTP 403: enable the json format under search.formats in SearXNG settings' }
+  if (!response.ok) return { kind: 'error', reason: `HTTP ${response.status}` }
+  try {
+    return { kind: 'results', results: parseSearxngResults(await response.json(), 10) }
+  } catch {
+    return { kind: 'error', reason: 'the response was not JSON' }
+  }
+}
+
+async function searxngIsUp(base: string): Promise<boolean> {
+  try {
+    const response = await fetch(searxngEndpoint(base, 'healthz'), { signal: AbortSignal.timeout(SEARXNG_PROBE_TIMEOUT_MS) })
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+/** Runs the start command detached, at most once per interval. Returns whether a start is under way. */
+export function searxngStarter(command: string | undefined, cwd: string, now: () => number = Date.now): () => boolean {
+  let lastStart = Number.NEGATIVE_INFINITY
+  return () => {
+    if (!command) return false
+    if (now() - lastStart < SEARXNG_RESTART_INTERVAL_MS) return true
+    lastStart = now()
+    try {
+      const child = spawn(command, { cwd, shell: true, detached: true, stdio: 'ignore' })
+      child.on('error', () => {})
+      child.unref()
+      return true
+    } catch {
+      return false
+    }
+  }
+}
+
+const fetchParameters = Type.Object({
+  url: Type.String({ description: 'Absolute http(s) URL to fetch' }),
+  prompt: Type.Optional(Type.String({ description: 'What to extract or answer from the page; returns the model’s answer instead of the raw markdown' })),
+})
+
 export default function webExtension(pi: ExtensionAPI) {
   const fetchCache = new Map<string, { expires: number; body: string }>()
+  const settings = readWebSettings()
+  const searxngUrl = settings.searxngUrl
+  const startSearxng = searxngStarter(settings.startCommand, getAgentDir())
+  // Warm it up as the session loads, so the first search usually finds it running.
+  if (searxngUrl && settings.startCommand) {
+    void searxngIsUp(searxngUrl).then((up) => up || startSearxng())
+  }
+  /** Results from SearXNG when configured, else DuckDuckGo; a message when SearXNG can't answer. */
+  async function findResults(query: string, signal?: AbortSignal): Promise<{ results: SearchResult[] } | { message: string }> {
+    if (!searxngUrl) {
+      const outcome = await fetchText(SEARCH_ENDPOINT + encodeURIComponent(query), 'follow', SEARCH_LIMIT, signal)
+      return { results: parseSearchResults(outcome.kind === 'body' ? outcome.text : '', 10) }
+    }
+    const outcome = await searchSearxng(searxngUrl, query, signal)
+    if (outcome.kind === 'results') return { results: outcome.results }
+    if (outcome.kind === 'error') return { message: `SearXNG search failed: ${outcome.reason}` }
+    return {
+      message: startSearxng() ? `SearXNG at ${searxngUrl} is not running (${outcome.reason}). It is starting in the background; retry web_search in about 30 seconds.` : `SearXNG at ${searxngUrl} is not reachable (${outcome.reason}). Start it, then retry web_search.`,
+    }
+  }
+
   pi.registerTool({
     name: 'web_search',
     label: 'Web search',
-    description: 'Search the web (DuckDuckGo). Returns titles, URLs, and snippets. Use web_fetch to read a result in full.',
+    description: `Search the web (${searxngUrl ? 'SearXNG' : 'DuckDuckGo'}). Returns titles, URLs, and snippets. Use web_fetch to read a result in full.`,
     parameters: Type.Object({
       query: Type.String({ description: 'Search query' }),
       count: Type.Optional(Type.Number({ description: 'Max results (default 5)' })),
@@ -384,11 +521,11 @@ export default function webExtension(pi: ExtensionAPI) {
       blocked_domains: Type.Optional(Type.Array(Type.String(), { description: 'Exclude results from these domains' })),
     }),
     async execute(_id, params, signal) {
-      // Claude documents allowed/blocked domains as mutually exclusive; allowed wins.
-      const outcome = await fetchText(SEARCH_ENDPOINT + encodeURIComponent(params.query), 'follow', SEARCH_LIMIT, signal)
-      const text = outcome.kind === 'body' ? outcome.text : ''
       const limit = Math.min(params.count ?? 5, 10)
-      const results = filterByDomain(parseSearchResults(text, 10), params.allowed_domains, params.blocked_domains).slice(0, limit)
+      const found = await findResults(params.query, signal)
+      if ('message' in found) return { content: [{ type: 'text' as const, text: found.message }], details: {} }
+      // Claude documents allowed/blocked domains as mutually exclusive; allowed wins.
+      const results = filterByDomain(found.results, params.allowed_domains, params.blocked_domains).slice(0, limit)
       if (results.length === 0) {
         return { content: [{ type: 'text' as const, text: 'No results found.' }], details: {} }
       }
@@ -400,12 +537,9 @@ export default function webExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: 'web_fetch',
     label: 'Web fetch',
-    description:
-      'Fetch a URL and return its content converted to markdown. Pass `prompt` to get a focused answer extracted from the page instead of the raw content. http URLs are upgraded to https, a redirect to a different host is reported rather than followed, and responses are cached per URL for 15 minutes by default (CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS).',
-    parameters: Type.Object({
-      url: Type.String({ description: 'Absolute http(s) URL to fetch' }),
-      prompt: Type.Optional(Type.String({ description: 'What to extract or answer from the page; returns the model’s answer instead of the raw markdown' })),
-    }),
+    description: `Fetch a URL and return its content converted to markdown.${settings.fetchPrompt ? ' Pass `prompt` to get a focused answer extracted from the page instead of the raw content.' : ''} http URLs are upgraded to https, a redirect to a different host is reported rather than followed, and responses are cached per URL for 15 minutes by default (CLAUDE_CODE_WEBFETCH_CACHE_TTL_MS).`,
+    // With webFetch.prompt off the schema drops `prompt`, and a stray one is ignored below.
+    parameters: settings.fetchPrompt ? fetchParameters : (Type.Omit(fetchParameters, ['prompt']) as unknown as typeof fetchParameters),
     async execute(_id, params, signal, _onUpdate, ctx) {
       if (!/^https?:\/\//.test(params.url)) {
         return { content: [{ type: 'text' as const, text: 'Only http(s) URLs are supported.' }], details: {} }
@@ -436,7 +570,7 @@ export default function webExtension(pi: ExtensionAPI) {
       // falls back to the raw markdown and returns something. The nested call's
       // usage rides on the result either way, so pi counts it in session totals.
       let usage: Usage | undefined
-      if (params.prompt && ctx?.model) {
+      if (settings.fetchPrompt && params.prompt && ctx?.model) {
         const answer = await answerFromPage(ctx.model, params.prompt, target, body, signal, ctx.modelRegistry)
         if (answer?.text) return { content: [{ type: 'text' as const, text: answer.text }], details: {}, usage: answer.usage }
         // An empty answer still cost the completion; the fallback carries its usage.
