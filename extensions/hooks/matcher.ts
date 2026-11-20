@@ -126,34 +126,51 @@ function withCommand(raw: HookCommand): HookCommand {
   return raw
 }
 
+/** Claude runs a handler defined in more than one settings file once, as the copy from
+ * the highest-precedence source (user < project < local < `--settings` < managed) with
+ * all of that copy's fields: a repository's `async` copy must not unblock a managed or
+ * flag guard. A plugin's or skill's copy of the same handler stays separate. Handlers that share a command but
+ * differ in what they run or when (http headers, exec-form args, an `if` filter, an
+ * mcp_tool input) are different handlers: `if` is applied after this, so collapsing two
+ * filters left the other tool call with no guard. */
+function keepOnce(result: HookCommand[], seen: Map<string, number>, hook: HookCommand): void {
+  const key = handlerKey(hook)
+  const kept = seen.get(key)
+  if (kept === undefined) {
+    seen.set(key, result.length)
+    result.push(hook)
+    return
+  }
+  // Replaced in place: the handler keeps the position of its first occurrence.
+  if ((hook.sourceRank ?? 0) > (result[kept].sourceRank ?? 0)) result[kept] = hook
+}
+
+/** What makes two declarations the same handler. */
+export function handlerKey(hook: HookCommand): string {
+  return `${hook.origin ?? 'settings'}\n${hook.command}\n${JSON.stringify([hook.headers, hook.args, hook.if, hook.input])}`
+}
+
 function collectCommands(matchers: HookMatcher[] | undefined, applies: (entry: HookMatcher) => boolean): HookCommand[] {
   const result: HookCommand[] = []
-  const seen = new Set<string>()
+  const seen = new Map<string, number>()
   for (const entry of matchers ?? []) {
     if (!applies(entry)) continue
     for (const raw of (entry.hooks ?? []).filter(isRunnableHook)) {
       // A once-hook that already ran successfully is removed, as Claude documents.
       if (raw.spent === true) continue
-      const hook = withCommand(raw)
-      // Claude runs a handler defined in more than one settings file once; a
-      // plugin's or skill's copy of the same handler stays separate. Handlers that
-      // share a command but differ in what they run or when (http headers, exec-form
-      // args, an `if` filter, an mcp_tool input) are different handlers: `if` is applied
-      // after this, so collapsing two filters left the other tool call with no guard.
-      const key = `${hook.origin ?? 'settings'}\n${hook.command}\n${JSON.stringify([hook.headers, hook.args, hook.if, hook.input])}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      result.push(hook)
+      keepOnce(result, seen, withCommand(raw))
     }
   }
   return result
 }
 
 /** Command specs whose matcher applies to any of the given tool/source names.
- * Multiple candidates let one event offer both the pi name and its Claude alias. */
-export function matchingCommands(matchers: HookMatcher[] | undefined, names: string | readonly string[]): HookCommand[] {
+ * Multiple candidates let one event offer both the pi name and its Claude alias.
+ * A group whose matcher also applies to any `unless` name is left out, so a call
+ * offered under two identities runs each group once. */
+export function matchingCommands(matchers: HookMatcher[] | undefined, names: string | readonly string[], unless: readonly string[] = []): HookCommand[] {
   const candidates = typeof names === 'string' ? [names] : names
-  return collectCommands(matchers, (entry) => matcherApplies(entry.matcher, candidates))
+  return collectCommands(matchers, (entry) => matcherApplies(entry.matcher, candidates) && !(unless.length > 0 && matcherApplies(entry.matcher, unless)))
 }
 
 /** Command specs for an event without matcher support (Stop, UserPromptSubmit): a
@@ -186,7 +203,10 @@ export function passesIfFilter(hook: HookCommand, target: IfFilterTarget | undef
   if (!parsed) return false
   const fold = (name: string): string => name.toLowerCase().replaceAll('-', '_')
   const ruleTools = new Set(parsed[1].split('|').map(fold))
-  const toolMatches = ruleTools.has(fold(target.piName)) || (target.claudeName !== undefined && ruleTools.has(fold(target.claudeName)))
+  // tools-reference: Monitor "uses the same permission rules as Bash", so a Bash rule
+  // also judges a Monitor command.
+  const bashCoversMonitor = ruleTools.has('bash') && fold(target.piName) === 'monitor'
+  const toolMatches = bashCoversMonitor || ruleTools.has(fold(target.piName)) || (target.claudeName !== undefined && ruleTools.has(fold(target.claudeName)))
   if (!toolMatches) return false
   const pattern = parsed[2]
   if (pattern === undefined) return true
@@ -212,12 +232,14 @@ function matchesToolPattern(piName: string, input: Record<string, unknown> | nul
   const str = (value: unknown): string => (typeof value === 'string' ? value : '')
   switch (piName) {
     case 'bash':
+    case 'monitor':
       return str(input?.command).length > 0 && matchesBashIfFilter(str(input?.command), pattern)
     case 'web_fetch':
       return matchesDomainRules(str(input?.url), [pattern])
     case 'subagent':
       return matchesAgentRules(agentNamesIn(input), [pattern])
     case 'slash_command':
+    case 'plugin_skill':
       return matchesSkillRules(str(input?.command), [pattern])
     default: {
       // Normalised as pi's file tools resolve it (~, a leading @, a file:// URL), because

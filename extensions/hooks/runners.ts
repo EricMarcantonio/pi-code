@@ -9,7 +9,7 @@ import * as fs from 'node:fs'
 import type { Api, Model } from '@earendil-works/pi-ai'
 import { runAgent } from '../internal/agent-run.ts'
 import { callMcpTool } from '../internal/mcp-call.ts'
-import { type CompletionRegistry, completeText } from '../internal/model-complete.ts'
+import { type CompletionRegistry, completeText, modelOutputLimit } from '../internal/model-complete.ts'
 import { killProcessTree } from '../internal/process-tree.ts'
 import { resolveShell } from '../internal/shell-resolve.ts'
 import { errorMessage } from '../internal/values.ts'
@@ -317,7 +317,9 @@ export async function runPromptHook(hook: HookCommand, payload: unknown, model: 
   const prompt = substituteArguments(withInput, payload)
   const signal = AbortSignal.timeout(timeoutMs)
   try {
-    const { text: answer } = await completeText(model, prompt, { system: PROMPT_HOOK_SYSTEM, maxTokens: 512, signal, registry })
+    // Claude Code sets no output cap here: the model's own limit applies, so a long reason
+    // is never cut off mid-JSON.
+    const { text: answer } = await completeText(model, prompt, { system: PROMPT_HOOK_SYSTEM, maxTokens: modelOutputLimit(model), signal, registry })
     return { code: 0, stdout: answer, stderr: '', timedOut: false }
   } catch (error) {
     return abortAwareFailure(signal, error)

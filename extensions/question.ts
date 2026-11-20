@@ -1,17 +1,16 @@
 /**
- * Question Tool - a question with options, single- or multi-select.
- * Full custom UI: options list + inline editor for "Type something..." (single-select
- * only), or space-toggled checkboxes when `multiSelect` is set. An optional `header`
- * labels the question. Escape in the editor returns to options; Escape in options cancels.
- * Multiple questions per call are not batched; ask sequentially.
- * On the TUI each question is also offered to a remote responder over pi.events
- * (REMOTE_QUESTION_CHANNEL); the first answer, local or remote, wins.
+ * Question Tool - 1-4 questions with options, single- or multi-select.
+ * On the TUI the questions share one form: an inline "Type something." text row, a
+ * "Chat about this" row and, for several questions, tabs and a final review. Escape
+ * anywhere cancels, as in Claude Code. Each question is also offered to a remote
+ * responder over pi.events (REMOTE_QUESTION_CHANNEL); the first answer, local or
+ * remote, wins.
  */
 
 import { randomUUID } from 'node:crypto'
 import * as os from 'node:os'
 import type { ExtensionAPI, ExtensionContext, Theme } from '@earendil-works/pi-coding-agent'
-import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth } from '@earendil-works/pi-tui'
+import { Input, Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
 import { readManagedSettings } from './internal/managed-settings.ts'
 import { readUserSetting } from './internal/settings-chain.ts'
@@ -21,18 +20,22 @@ interface OptionWithDesc {
   description?: string
 }
 
-type DisplayOption = OptionWithDesc & { isOther?: boolean }
-
 interface QuestionDetails {
   question: string
   header?: string
   options: string[]
   answer: string | null
   wasCustom?: boolean
+  skipped?: boolean
+  questions?: QuestionDetails[]
   multiSelect?: boolean
   /** Auto-continued on askUserQuestionTimeout rather than answered or cancelled. */
   timedOut?: boolean
+  /** The user chose "Chat about this" to clarify the questions. */
+  chat?: boolean
 }
+
+type QuestionResult = { content: Array<{ type: 'text'; text: string }>; details: QuestionDetails }
 
 // Options with labels and optional descriptions
 const OptionSchema = Type.Object({
@@ -61,7 +64,7 @@ export const QuestionParams = Type.Object({
 export interface QuestionSpec {
   question: string
   header?: string
-  options: DisplayOption[]
+  options: OptionWithDesc[]
   multiSelect?: boolean
 }
 
@@ -78,6 +81,9 @@ export interface RemoteQuestionOffer {
   options: OptionWithDesc[]
   multiSelect: boolean
   allowFreeText: boolean
+  /** Only when the call asks several questions, whose offers are live together:
+   * `id` is shared by the call's offers, `index` is 1-based, `total` is their count. */
+  batch?: { id: string; index: number; total: number }
   signal: AbortSignal
   /** Must be called during event emission; only one listener receives a settle handle. */
   claim: () => ((outcome: RemoteQuestionOutcome) => boolean) | undefined
@@ -85,9 +91,9 @@ export interface RemoteQuestionOffer {
   touch: () => boolean
 }
 
-/** Normalize either accepted shape into the list of questions to ask. */
+/** Normalize either accepted shape into the list of questions to ask, headers shortened. */
 function questionList(params: Partial<QuestionSpec> & { questions?: QuestionSpec[] }): QuestionSpec[] {
-  if (params.questions && params.questions.length > 0) return params.questions
+  if (params.questions && params.questions.length > 0) return params.questions.map((spec) => ({ ...spec, header: shortHeader(spec.header) }))
   if (typeof params.question === 'string') return [{ question: params.question, header: shortHeader(params.header), options: params.options ?? [], multiSelect: params.multiSelect }]
   return []
 }
@@ -120,106 +126,225 @@ export function askUserQuestionTimeoutMs(home: string = os.homedir()): number | 
   return parseAskUserQuestionTimeout(readUserSetting(home, 'askUserQuestionTimeout'))
 }
 
-function checkbox(checked: boolean | undefined): string {
-  if (checked === undefined) return ''
-  return checked ? '[x] ' : '[ ] '
+function unreachable(value: never): never {
+  throw new Error(`Unhandled ${JSON.stringify(value)}`)
 }
 
-function optionLine(opt: DisplayOption, index: number, selected: boolean, editMode: boolean, checked: boolean | undefined, theme: Theme): string {
-  const label = `${index + 1}. ${checkbox(checked)}${opt.label}`
-  const prefix = selected ? theme.fg('accent', '> ') : '  '
-  if (opt.isOther === true && editMode) {
-    return prefix + theme.fg('accent', `${label} ✎`)
+function checkbox(checked: boolean, theme: Theme): string {
+  return checked ? theme.fg('success', '[✔] ') : theme.fg('text', '[ ] ')
+}
+
+/** `field` is a pre-rendered text field appended after the label, `box` a rendered checkbox
+ * before it. A `confirmed` row is the question's single-select answer. */
+type RowMarks = { field?: string; box?: string; confirmed?: boolean; width?: number }
+
+function optionLine(label: string, index: number, selected: boolean, theme: Theme, { field = '', box = '', confirmed = false, width }: RowMarks = {}): string {
+  let color: 'success' | 'accent' | 'text' = 'text'
+  if (confirmed) color = 'success'
+  else if (selected) color = 'accent'
+  const tick = confirmed ? theme.fg('success', ' ✔') : ''
+  const body = (selected ? theme.fg('accent', '❯ ') : '  ') + theme.fg(color, `${index + 1}. `) + box + theme.fg(color, label) + field
+  // As in Claude Code, a long label is cut short and the tick stays in view.
+  return (width === undefined ? body : truncateToWidth(body, Math.max(0, width - visibleWidth(tick)))) + tick
+}
+
+/** One row of a question; the cursor indexes into the question's rows. */
+type Row = { kind: 'option'; index: number; option: OptionWithDesc } | { kind: 'text' } | { kind: 'chat' }
+
+function questionRows(spec: QuestionSpec): Row[] {
+  return [...spec.options.map((option, index): Row => ({ kind: 'option', index, option })), { kind: 'text' }, { kind: 'chat' }]
+}
+
+type SingleAnswer = { kind: 'option'; index: number } | { kind: 'text'; text: string }
+/** The checked option indices in option order, plus the free-text row when it has text. */
+type MultiAnswer = { kind: 'multi'; indices: number[]; text?: string }
+type Answer = SingleAnswer | MultiAnswer
+/** An unconfirmed question when the idle timeout fires; a multiSelect sends what is checked. */
+type TimedOut = { kind: 'timedOut'; selected?: MultiAnswer }
+type Outcome = Answer | TimedOut
+
+/** What the form ends with; `undefined` in `answers` is an unanswered question. A cancel is null. */
+type FormResult = { kind: 'submit'; answers: Array<Answer | undefined> } | { kind: 'timeout'; answers: Outcome[] } | { kind: 'chat'; answers: Array<Answer | undefined> }
+
+/** A question is answered exactly when `confirmed` is set. */
+type QuestionState = { rows: Row[]; cursor: number; typing: boolean; draft: Input } & ({ mode: 'single'; confirmed?: SingleAnswer } | { mode: 'multi'; checked: boolean[]; confirmed?: MultiAnswer })
+
+/** Text still being typed counts once typing stops, so a remote answer never submits a half-typed draft. */
+function settledText(state: QuestionState): string {
+  return state.typing ? '' : state.draft.getValue().trim()
+}
+
+function multiAnswer(checked: boolean[], text = ''): MultiAnswer {
+  return { kind: 'multi', indices: checked.flatMap((on, index) => (on ? [index] : [])), ...(text ? { text } : {}) }
+}
+
+/** Text in the field under the highlight that Enter has not confirmed as it stands. */
+function unconfirmedText(state: QuestionState | undefined): boolean {
+  const text = state?.draft.getValue().trim()
+  if (!state?.typing || !text) return false
+  return state.mode === 'multi' || state.confirmed?.kind !== 'text' || state.confirmed.text !== text
+}
+
+/** Confirms an answer that matches the question's mode. */
+function confirm(state: QuestionState, answer: Answer): void {
+  if (state.mode === 'multi') {
+    if (answer.kind === 'multi') state.confirmed = answer
+  } else if (answer.kind !== 'multi') state.confirmed = answer
+}
+
+/** A confirmed multiSelect follows every toggle and keystroke. As in Claude Code, a confirmed
+ * single-select text answer changes only when Enter confirms the edited text. */
+function followEdits(state: QuestionState): void {
+  if (state.mode === 'multi' && state.confirmed) state.confirmed = multiAnswer(state.checked, state.draft.getValue().trim())
+}
+
+function toggleChecked(state: QuestionState): void {
+  const row = state.rows[state.cursor]
+  if (state.mode !== 'multi' || row.kind !== 'option') return
+  state.checked[row.index] = !state.checked[row.index]
+  followEdits(state)
+}
+
+function answerText(spec: QuestionSpec, answer: Answer): string {
+  switch (answer.kind) {
+    case 'option':
+      return spec.options[answer.index].label
+    case 'text':
+      return answer.text
+    case 'multi':
+      return [...answer.indices.map((index) => spec.options[index].label), ...(answer.text ? [answer.text] : [])].join(', ')
+    default:
+      return unreachable(answer)
   }
-  if (selected) {
-    return prefix + theme.fg('accent', label)
-  }
-  return `  ${theme.fg('text', label)}`
 }
 
 interface QuestionView {
   width: number
   question: string
   header?: string
-  options: DisplayOption[]
-  optionIndex: number
-  editMode: boolean
-  multiSelect: boolean
-  checked: boolean[]
-  editor: Editor
+  state: QuestionState
+  field: string
   theme: Theme
-  /** Claude: "You see a countdown for the last 20 seconds." Undefined the rest of
-   * the idle window, and always when there is no configured timeout at all. */
-  countdownSeconds?: number
 }
 
+/** The top border, question and rows; the caller adds the tab bar and footer. */
 function buildQuestionLines(view: QuestionView): string[] {
-  const { width, question, header, options, optionIndex, editMode, multiSelect, checked, editor, theme, countdownSeconds } = view
+  const { width, question, header, state, field, theme } = view
   const lines: string[] = []
   const add = (s: string) => lines.push(truncateToWidth(s, width))
 
   add(theme.fg('accent', '─'.repeat(width)))
-  if (header) add(theme.fg('muted', ` [${header}]`))
-  add(theme.fg('text', ` ${question}`))
-  lines.push('')
-
-  for (let i = 0; i < options.length; i++) {
-    const opt = options[i]
-    const box = multiSelect && opt.isOther !== true ? checked[i] : undefined
-    add(optionLine(opt, i, i === optionIndex, editMode, box, theme))
-    if (opt.description) {
-      add(`     ${theme.fg('muted', opt.description)}`)
-    }
-  }
-
-  if (editMode) {
+  if (header) {
+    add(theme.bg('selectedBg', theme.fg('text', ` ☐ ${header} `)))
     lines.push('')
-    add(theme.fg('muted', ' Your answer:'))
-    for (const line of editor.render(width - 2)) {
-      add(` ${line}`)
-    }
   }
-
+  const wrapIndented = (text: string, indent: number, color: 'text' | 'muted') => {
+    // Leave at least one column for text when the terminal is narrower than the indent.
+    const pad = ' '.repeat(Math.max(0, Math.min(indent, width - 1)))
+    for (const line of wrapTextWithAnsi(text.trimEnd(), Math.max(1, width - pad.length))) add(pad + theme.fg(color, line))
+  }
+  wrapIndented(question, 1, 'text')
   lines.push('')
-  add(theme.fg('dim', navHint(editMode, multiSelect)))
-  if (countdownSeconds !== undefined) {
-    add(theme.fg('warning', ` Auto-continuing in ${countdownSeconds}s if idle · press any key to stay`))
-  }
-  add(theme.fg('accent', '─'.repeat(width)))
 
+  const box = (checked: boolean) => (state.mode === 'multi' ? checkbox(checked, theme) : '')
+  const confirmed = state.mode === 'single' ? state.confirmed : undefined
+  state.rows.forEach((row, i) => {
+    const selected = i === state.cursor
+    switch (row.kind) {
+      case 'option':
+        add(optionLine(row.option.label, i, selected, theme, { box: box(state.mode === 'multi' && state.checked[row.index]), confirmed: confirmed?.kind === 'option' && confirmed.index === row.index, width }))
+        if (row.option.description) wrapIndented(row.option.description, 5, 'muted')
+        return
+      case 'text':
+        // A multiSelect free-text row is checked exactly when it has text; Space never toggles it.
+        // As in Claude Code, a confirmed text answer keeps its tick while the field is edited.
+        add(optionLine('', i, selected, theme, { field, box: box(state.draft.getValue().trim() !== ''), confirmed: confirmed?.kind === 'text', width }))
+        return
+      case 'chat':
+        add(theme.fg('dim', '─'.repeat(width)))
+        add(optionLine('Chat about this', i, selected, theme))
+        return
+      default:
+        unreachable(row)
+    }
+  })
   return lines
 }
 
-function navHint(editMode: boolean, multiSelect: boolean): string {
-  if (editMode) return ' Enter to submit • Esc to go back'
-  if (multiSelect) return ' ↑↓ navigate • Space to toggle • Enter to confirm • Esc to cancel'
-  return ' ↑↓ navigate • Enter to select • Esc to cancel'
+function navHint(multiSelect: boolean, tabs: boolean): string {
+  // The longest variant, a multiSelect question in a batch, is exactly 80 columns.
+  const move = tabs ? 'Tab/Arrow keys to navigate' : '↑/↓ to navigate'
+  return multiSelect ? ` Space to toggle · ${move} · Enter to confirm · Esc to cancel` : ` Enter to select · ${move} · Esc to cancel`
 }
 
-/** The comma-joined labels of the checked options, in order. */
-function selectedLabels(options: DisplayOption[], checked: boolean[]): string {
-  return options
-    .filter((_, i) => checked[i])
-    .map((o) => o.label)
-    .join(', ')
+/** The first and last tab that fit in `room` columns, one column apart, grown
+ * outward from the active tab so it always stays visible. */
+function tabWindow(widths: number[], active: number, room: number): [number, number] {
+  let first = active
+  let last = active
+  let used = widths[active]
+  for (let grew = true; grew; ) {
+    grew = false
+    if (first > 0 && used + 1 + widths[first - 1] <= room) {
+      used += 1 + widths[--first]
+      grew = true
+    }
+    if (last < widths.length - 1 && used + 1 + widths[last + 1] <= room) {
+      used += 1 + widths[++last]
+      grew = true
+    }
+  }
+  return [first, last]
 }
 
 /** The result line for a question that was not cancelled. */
-function renderAnswered(details: QuestionDetails, answer: string, theme: Theme): Text {
+function renderAnswered(details: QuestionDetails, answer: string, theme: Theme): string {
+  if (details.skipped) return theme.fg('warning', 'User skipped this question')
   if (details.timedOut) {
     const already = answer ? theme.fg('muted', ` (already selected: ${answer})`) : ''
-    return new Text(theme.fg('warning', '⏱ Auto-continued (no response)') + already, 0, 0)
+    return theme.fg('warning', '⏱ Auto-continued (no response)') + already
   }
 
   if (details.wasCustom) {
-    return new Text(theme.fg('success', '✓ ') + theme.fg('muted', '(wrote) ') + theme.fg('accent', answer), 0, 0)
+    return theme.fg('success', '✓ ') + theme.fg('muted', '(wrote) ') + theme.fg('accent', answer)
   }
   if (details.multiSelect) {
-    return new Text(theme.fg('success', '✓ ') + theme.fg('accent', answer || '(none)'), 0, 0)
+    return theme.fg('success', '✓ ') + theme.fg('accent', answer || '(none)')
   }
   const idx = details.options.indexOf(answer) + 1
   const display = idx > 0 ? `${idx}. ${answer}` : answer
-  return new Text(theme.fg('success', '✓ ') + theme.fg('accent', display), 0, 0)
+  return theme.fg('success', '✓ ') + theme.fg('accent', display)
+}
+
+/** Claude Code's wording for each kind of question. */
+function textRowLabel(multiSelect: boolean | undefined): string {
+  return multiSelect ? 'Type something' : 'Type something.'
+}
+
+/** Arguments stream in partially, so any field may still be missing. */
+function renderOptions(args: Partial<QuestionSpec>, theme: Theme): string {
+  const multi = args.multiSelect === true
+  const opts = Array.isArray(args.options) ? args.options : []
+  if (!opts.length) return ''
+  const labels = opts.map((o: OptionWithDesc) => o.label)
+  const numbered = [...labels, 'Type something.'].map((o, i) => `${i + 1}. ${o}`)
+  const line = `  Options${multi ? ' (multi)' : ''}: ${numbered.join(', ')}`
+  return `\n${theme.fg('dim', line)}`
+}
+
+function renderBatchCall(specs: Array<Partial<QuestionSpec> | null>, theme: Theme): Text {
+  const lines = specs.map((entry, index) => {
+    const spec = entry ?? {}
+    const heading = shortHeader(spec.header) ?? `Q${index + 1}`
+    return theme.fg('toolTitle', theme.bold(`question [${heading}] `)) + String(spec.question ?? '') + renderOptions(spec, theme)
+  })
+  return new Text(lines.join('\n\n'), 0, 0)
+}
+
+function renderSingleCall(args: Partial<QuestionSpec>, theme: Theme): Text {
+  const heading = args.header ? `[${shortHeader(String(args.header))}] ` : ''
+  const text = theme.fg('toolTitle', theme.bold('question ')) + theme.fg('muted', heading + String(args.question ?? ''))
+  return new Text(text + renderOptions(args, theme), 0, 0)
 }
 
 export default function question(pi: ExtensionAPI) {
@@ -238,35 +363,28 @@ export default function question(pi: ExtensionAPI) {
       if (specs.length === 0) {
         return { content: [{ type: 'text', text: 'Error: No question provided' }], details: { question: '', options: [], answer: null } as QuestionDetails }
       }
-      if (specs.length === 1) return await askOne(specs[0], ctx, pi.events, signal)
+      if (ctx.hasUI && ctx.mode === 'tui' && specs.every((spec) => spec.options.length > 0)) {
+        return overlayResult(specs, await askViaOverlay(specs, ctx, askUserQuestionTimeoutMs(), pi.events, signal))
+      }
 
-      // Several questions are asked in sequence; a cancel ends the run, since the
-      // remaining answers would be guesses about a flow the user just declined.
-      const texts: string[] = []
-      const collected: QuestionDetails[] = []
+      const results: QuestionResult[] = []
       for (const spec of specs) {
         const result = await askOne(spec, ctx, pi.events, signal)
-        const detail = result.details as QuestionDetails
-        collected.push(detail)
-        texts.push(`${spec.question}\n${result.content[0].text}`)
-        if (detail.answer === null) break
+        results.push(result)
+        if (result.details.answer === null) {
+          // Only the user's cancel declines the call; an error (no UI, no options) keeps its own text.
+          if (ctx.hasUI && spec.options.length > 0) return cancelled(specs)
+          break
+        }
       }
-      return { content: [{ type: 'text', text: texts.join('\n\n') }], details: { ...collected[0], questions: collected } as QuestionDetails }
+      return combine(specs, results)
     },
 
     renderCall(args, theme, _context) {
-      const multi = args.multiSelect === true
-      const heading = args.header ? `[${shortHeader(String(args.header))}] ` : ''
-      let text = theme.fg('toolTitle', theme.bold('question ')) + theme.fg('muted', heading + String(args.question ?? ''))
-      const opts = Array.isArray(args.options) ? args.options : []
-      if (opts.length) {
-        const labels = opts.map((o: OptionWithDesc) => o.label)
-        const shown = multi ? labels : [...labels, 'Type something.']
-        const numbered = shown.map((o, i) => `${i + 1}. ${o}`)
-        const optionsLine = `  Options${multi ? ' (multi)' : ''}: ${numbered.join(', ')}`
-        text += `\n${theme.fg('dim', optionsLine)}`
+      if (Array.isArray(args.questions) && args.questions.length > 0) {
+        return renderBatchCall(args.questions, theme)
       }
-      return new Text(text, 0, 0)
+      return renderSingleCall(args, theme)
     },
     renderResult(result, _options, theme, _context) {
       const details = result.details as QuestionDetails | undefined
@@ -275,16 +393,33 @@ export default function question(pi: ExtensionAPI) {
         return new Text(text?.type === 'text' ? text.text : '', 0, 0)
       }
 
+      if (details.chat) return new Text(theme.fg('warning', 'User wants to clarify these questions'), 0, 0)
+
+      if (details.questions && details.answer !== null) {
+        return new Text(
+          details.questions
+            .map((detail) => {
+              const rendered = detail.answer === null ? theme.fg('warning', 'Cancelled') : renderAnswered(detail, detail.answer, theme)
+              const prefix = detail.header ? `[${detail.header}] ` : ''
+              return `${prefix}${detail.question}\n${rendered}`
+            })
+            .join('\n\n'),
+          0,
+          0,
+        )
+      }
+
       if (details.answer === null) {
         return new Text(theme.fg('warning', 'Cancelled'), 0, 0)
       }
 
-      return renderAnswered(details, details.answer, theme)
+      return new Text(renderAnswered(details, details.answer, theme), 0, 0)
     },
   })
 }
 
-type QuestionAnswer = Awaited<ReturnType<typeof askViaOverlay>>
+/** null is a cancel. */
+type QuestionAnswer = Answer | null
 
 /** A claimed offer raced against the open overlay: whichever answers first wins. */
 interface RemoteQuestion {
@@ -302,12 +437,12 @@ function validIndices(indices: unknown, count: number, multiSelect: boolean): in
 
 /** A remote outcome as the answer it stands for: null is a cancel, undefined is a
  * pass or anything this question cannot accept, which must never become an answer. */
-function remoteAnswer(outcome: RemoteQuestionOutcome, options: DisplayOption[], multiSelect: boolean): QuestionAnswer | undefined {
+function remoteAnswer(outcome: RemoteQuestionOutcome, options: OptionWithDesc[], multiSelect: boolean): QuestionAnswer | undefined {
   if (outcome === null || typeof outcome !== 'object') return undefined
   if (outcome.action === 'cancel') return null
   if (outcome.action === 'text') {
     const text = typeof outcome.text === 'string' ? outcome.text.trim() : ''
-    return !multiSelect && text ? { answer: text, wasCustom: true } : undefined
+    return !multiSelect && text ? { kind: 'text', text } : undefined
   }
   if (outcome.action !== 'answer') return undefined
   // Read once and copied, so a getter or Proxy cannot answer with other indices
@@ -315,12 +450,11 @@ function remoteAnswer(outcome: RemoteQuestionOutcome, options: DisplayOption[], 
   const raw: unknown = outcome.indices
   const indices: unknown = Array.isArray(raw) ? [...raw] : undefined
   if (!validIndices(indices, options.length, multiSelect)) return undefined
-  const checked = options.map((_, index) => indices.includes(index + 1))
-  return { answer: selectedLabels(options, checked), wasCustom: false, ...(multiSelect ? {} : { index: indices[0] }) }
+  return multiSelect ? multiAnswer(options.map((_, index) => indices.includes(index + 1))) : { kind: 'option', index: indices[0] - 1 }
 }
 
 /** Undefined when nobody claims synchronously, so the overlay opens with no async gap. */
-function offerRemoteQuestion(params: QuestionSpec, allOptions: DisplayOption[], ctx: ExtensionContext, events: ExtensionAPI['events'] | undefined, signal: AbortSignal | undefined): RemoteOffer | undefined {
+function offerRemoteQuestion(params: QuestionSpec, ctx: ExtensionContext, events: ExtensionAPI['events'] | undefined, signal: AbortSignal | undefined, batch?: RemoteQuestionOffer['batch']): RemoteOffer | undefined {
   if (!events) return undefined
   if (signal?.aborted) return { kind: 'settled', value: null }
 
@@ -330,10 +464,7 @@ function offerRemoteQuestion(params: QuestionSpec, allOptions: DisplayOption[], 
   let early: { value: QuestionAnswer } | undefined
   let deliver: ((value: QuestionAnswer) => void) | undefined
   let touchOverlay: (() => void) | undefined
-  const close = (): void => {
-    controller.abort()
-    signal?.removeEventListener('abort', abort)
-  }
+  const close = (): void => controller.abort()
   const settle = (value: QuestionAnswer): void => {
     close()
     if (deliver) deliver(value)
@@ -349,10 +480,11 @@ function offerRemoteQuestion(params: QuestionSpec, allOptions: DisplayOption[], 
     requestId: randomUUID(),
     sessionId: ctx.sessionManager.getSessionId(),
     question: params.question,
-    header: shortHeader(params.header),
+    header: params.header,
     options: params.options.map(({ label, description }) => ({ label, ...(description === undefined ? {} : { description }) })),
     multiSelect,
-    allowFreeText: allOptions.some((option) => option.isOther === true),
+    allowFreeText: !multiSelect,
+    ...(batch ? { batch } : {}),
     signal: controller.signal,
     claim: () => {
       if (claimed || controller.signal.aborted) return undefined
@@ -378,6 +510,8 @@ function offerRemoteQuestion(params: QuestionSpec, allOptions: DisplayOption[], 
   }
 
   events.emit(REMOTE_QUESTION_CHANNEL, offer)
+  // From here on the overlay's own abort listener cancels the question.
+  signal?.removeEventListener('abort', abort)
   if (early) return { kind: 'settled', value: early.value }
   if (!claimed || controller.signal.aborted) {
     close()
@@ -389,88 +523,138 @@ function offerRemoteQuestion(params: QuestionSpec, allOptions: DisplayOption[], 
       attach: (answer, touch) => {
         deliver = answer
         touchOverlay = touch
+        // A reply accepted before the form opened, while a later question was being offered.
+        if (early) answer(early.value)
       },
       close,
     },
   }
 }
 
-/** ui.custom() is terminal-only: with a UI but no terminal (RPC mode) it resolves
- * undefined immediately, which would read as a cancel without ever asking. Ask
- * through the dialog primitives there instead. askUserQuestionTimeout is a TUI
- * concept (a countdown, a keypress resetting it): the dialog-primitive fallback
- * has no keyboard or visible countdown to drive it, so it is not applied there. */
-async function collectAnswer(params: QuestionSpec, ctx: ExtensionContext, allOptions: DisplayOption[], multiSelect: boolean, events?: ExtensionAPI['events'], signal?: AbortSignal): Promise<QuestionAnswer> {
-  if (ctx.mode !== 'tui') return askViaDialogs(params, ctx, allOptions, multiSelect)
-  const offer = offerRemoteQuestion(params, allOptions, ctx, events, signal)
-  if (offer?.kind === 'settled') return offer.value
-  const remote = offer?.remote
-  try {
-    return await askViaOverlay(params, ctx, allOptions, multiSelect, askUserQuestionTimeoutMs(), remote)
-  } finally {
-    remote?.close()
-  }
-}
-
-async function askOne(params: QuestionSpec, ctx: ExtensionContext, events?: ExtensionAPI['events'], signal?: AbortSignal): Promise<{ content: Array<{ type: 'text'; text: string }>; details: QuestionDetails }> {
+async function askOne(spec: QuestionSpec, ctx: ExtensionContext, events: ExtensionAPI['events'] | undefined, signal: AbortSignal | undefined): Promise<QuestionResult> {
   if (!ctx.hasUI) {
     return {
       content: [{ type: 'text', text: 'Error: UI not available (running in non-interactive mode)' }],
-      details: {
-        question: params.question,
-        options: params.options.map((o) => o.label),
-        answer: null,
-      } as QuestionDetails,
+      details: { question: spec.question, options: spec.options.map((o) => o.label), answer: null },
     }
   }
+  if (spec.options.length === 0) {
+    return { content: [{ type: 'text', text: 'Error: No options provided' }], details: { question: spec.question, options: [], answer: null } }
+  }
+  // ui.custom() is terminal-only: in RPC mode it resolves undefined without asking.
+  // askUserQuestionTimeout needs a keyboard and a visible countdown, so dialogs do not apply it.
+  if (ctx.mode === 'tui') return overlayResult([spec], await askViaOverlay([spec], ctx, askUserQuestionTimeoutMs(), events, signal))
+  return answerToResult(spec, await askViaDialogs(spec, ctx))
+}
 
-  if (params.options.length === 0) {
-    return {
-      content: [{ type: 'text', text: 'Error: No options provided' }],
-      details: { question: params.question, options: [], answer: null } as QuestionDetails,
+/** A lone question's own result, or several joined under their questions. */
+function combine(specs: QuestionSpec[], results: QuestionResult[], text = results.map((result, index) => `${specs[index].question}\n${result.content[0].text}`).join('\n\n')): QuestionResult {
+  if (specs.length === 1) return results[0]
+  const collected = results.map((result) => result.details)
+  return { content: [{ type: 'text', text }], details: { ...collected[0], questions: collected } }
+}
+
+/** As in Claude, a cancel declines the whole call and discards answers already given. */
+function cancelled(specs: QuestionSpec[]): QuestionResult {
+  return combine(
+    specs,
+    specs.map((spec) => answerToResult(spec, null)),
+    'User cancelled the selection',
+  )
+}
+
+/** `result` is undefined when ui.custom resolves without a terminal, which reads as a cancel. */
+function overlayResult(specs: QuestionSpec[], result: FormResult | null | undefined): QuestionResult {
+  if (!result) return cancelled(specs)
+  const lone = specs.length === 1
+  switch (result.kind) {
+    case 'chat':
+      return chatResult(specs, result.answers)
+    case 'submit':
+      return combine(
+        specs,
+        specs.map((spec, index) => answerToResult(spec, result.answers[index])),
+      )
+    case 'timeout': {
+      const combined = combine(
+        specs,
+        specs.map((spec, index) => answerToResult(spec, result.answers[index], lone)),
+      )
+      if (lone) return combined
+      // Claude tells the model the user may be away on every timeout, even a fully answered one.
+      return { ...combined, content: [{ type: 'text', text: `${combined.content[0].text}\n\n${AWAY_NOTICE} ${PROCEED_NOTICE}` }] }
     }
+    default:
+      return unreachable(result)
+  }
+}
+
+/** Claude Code's clarify text for "Chat about this", followed by each question and the answer Submit would send. */
+function chatResult(specs: QuestionSpec[], answers: Array<Answer | undefined>): QuestionResult {
+  const asked = specs.map((spec, index) => {
+    const answer = answers[index]
+    const given = answer ? `Answer: ${answerText(spec, answer)}` : '(No answer provided)'
+    return `- "${spec.question}"\n  ${given}`
+  })
+  const text = `The user wants to clarify these questions.
+    This means they may have additional information, context or questions for you.
+    Take their response into account and then reformulate the questions if appropriate.
+    Start by asking them what they would like to clarify.
+
+    Questions asked:
+${asked.join('\n')}`
+  const collected = specs.map((spec, index) => answerToResult(spec, answers[index]).details)
+  return { content: [{ type: 'text', text }], details: { ...collected[0], ...(specs.length > 1 ? { questions: collected } : {}), chat: true } }
+}
+
+const AWAY_NOTICE = 'No response after the configured idle timeout; the user may be away from the keyboard.'
+const PROCEED_NOTICE = 'Proceed on your own judgment; you can ask again later if needed.'
+
+/** The checked labels, then the typed text on its own line; "(none)" only when both are empty. */
+function multiResultText(spec: QuestionSpec, answer: MultiAnswer): string {
+  const labels = answerText(spec, { kind: 'multi', indices: answer.indices })
+  const selected = labels || !answer.text ? [`User selected: ${labels || '(none)'}`] : []
+  return [...selected, ...(answer.text ? [`User wrote: ${answer.text}`] : [])].join('\n')
+}
+
+/** `outcome` undefined is a skipped question and null a cancel. `awayNotice` false
+ * leaves the timeout notice to the caller, which sends it once per call. */
+function answerToResult(spec: QuestionSpec, outcome: Outcome | null | undefined, awayNotice = true): QuestionResult {
+  const multiSelect = spec.multiSelect === true
+  const base = { question: spec.question, options: spec.options.map((o) => o.label), ...(spec.header ? { header: spec.header } : {}), ...(multiSelect ? { multiSelect: true } : {}) }
+
+  if (outcome === undefined) {
+    return { content: [{ type: 'text', text: 'User skipped this question' }], details: { ...base, answer: '', skipped: true } }
+  }
+  if (outcome === null) {
+    return { content: [{ type: 'text', text: 'User cancelled the selection' }], details: { ...base, answer: null } }
   }
 
-  const multiSelect = params.multiSelect === true
-  // The free-text option does not compose with checkbox selection, so it is single-select only.
-  const allOptions: DisplayOption[] = multiSelect ? [...params.options] : [...params.options, { label: 'Type something.', isOther: true }]
-
-  const result = await collectAnswer(params, ctx, allOptions, multiSelect, events, signal)
-
-  // Build simple options list for details; header/multiSelect appear only when set,
-  // so single-select details are unchanged.
-  const simpleOptions = params.options.map((o) => o.label)
-  const base = { question: params.question, options: simpleOptions, ...(params.header ? { header: shortHeader(params.header) } : {}), ...(multiSelect ? { multiSelect: true } : {}) }
-
-  if (!result) {
-    return {
-      content: [{ type: 'text', text: 'User cancelled the selection' }],
-      details: { ...base, answer: null } as QuestionDetails,
+  switch (outcome.kind) {
+    case 'timedOut': {
+      // Claude: "tells Claude you may be away from your keyboard, so Claude proceeds
+      // on its own judgment and can re-ask later." Not framed as a cancel: `answer` is
+      // '' rather than null, so renderResult and a batch's own null-check both read it
+      // as "answered nothing, but not declined" rather than the user having said no.
+      const selected = outcome.selected ? answerText(spec, outcome.selected) : ''
+      const labels = outcome.selected ? answerText(spec, { kind: 'multi', indices: outcome.selected.indices }) : ''
+      const typed = outcome.selected?.text
+      const already = (labels ? ` Already selected: ${labels}.` : '') + (typed ? ` Already typed: ${typed}.` : '')
+      return {
+        content: [{ type: 'text', text: awayNotice ? `${AWAY_NOTICE}${already} ${PROCEED_NOTICE}` : `No response.${already}` }],
+        details: { ...base, answer: selected, timedOut: true },
+      }
     }
-  }
-
-  if (result.timedOut) {
-    // Claude: "tells Claude you may be away from your keyboard, so Claude proceeds
-    // on its own judgment and can re-ask later." Not framed as a cancel: `answer` is
-    // '' rather than null, so renderResult and a batch's own null-check both read it
-    // as "answered nothing, but not declined" rather than the user having said no.
-    const already = multiSelect && result.answer ? ` Already selected: ${result.answer}.` : ''
-    return {
-      content: [{ type: 'text', text: `No response after the configured idle timeout; the user may be away from the keyboard.${already} Proceed on your own judgment; you can ask again later if needed.` }],
-      details: { ...base, answer: result.answer, timedOut: true } as QuestionDetails,
+    case 'text':
+      return { content: [{ type: 'text', text: `User wrote: ${outcome.text}` }], details: { ...base, answer: outcome.text, wasCustom: true } }
+    case 'option': {
+      const label = spec.options[outcome.index].label
+      return { content: [{ type: 'text', text: `User selected: ${outcome.index + 1}. ${label}` }], details: { ...base, answer: label, wasCustom: false } }
     }
-  }
-
-  if (result.wasCustom) {
-    return {
-      content: [{ type: 'text', text: `User wrote: ${result.answer}` }],
-      details: { ...base, answer: result.answer, wasCustom: true } as QuestionDetails,
-    }
-  }
-  const selectionText = multiSelect ? `User selected: ${result.answer || '(none)'}` : `User selected: ${result.index}. ${result.answer}`
-  return {
-    content: [{ type: 'text', text: selectionText }],
-    details: { ...base, answer: result.answer, wasCustom: false } as QuestionDetails,
+    case 'multi':
+      return { content: [{ type: 'text', text: multiResultText(spec, outcome) }], details: { ...base, answer: answerText(spec, outcome), wasCustom: false } }
+    default:
+      return unreachable(outcome)
   }
 }
 
@@ -480,7 +664,8 @@ const COUNTDOWN_WINDOW_MS = 20_000
  * second changes on time, coarse enough not to re-render needlessly often. */
 const IDLE_TICK_MS = 250
 
-/** Terminal path: the full custom overlay (options list, checkboxes, inline editor).
+/** Terminal path: the form for one or several questions. Each row is an option, then
+ * the free-text row, then "Chat about this"; several questions add tabs and a review.
  *
  * `timeoutMs`, when set, is Claude's askUserQuestionTimeout: "After a question sits
  * that long with no input, the dialog closes on its own: it submits any options
@@ -490,210 +675,324 @@ const IDLE_TICK_MS = 250
  * restarting the timer, the other documented reset trigger, is not implemented:
  * pi's TUI input stream is not confirmed to carry the terminal's own focus-report
  * escape sequences, and guessing at that risks misreading ordinary input as a
- * focus event on a terminal that reports it differently. Exported so the timer
- * mechanics are testable directly, independent of where timeoutMs itself is read
- * from (askUserQuestionTimeoutMs, tested separately).
+ * focus event on a terminal that reports it differently.
  */
-export function askViaOverlay(params: QuestionSpec, ctx: ExtensionContext, allOptions: DisplayOption[], multiSelect: boolean, timeoutMs?: number, remote?: RemoteQuestion): Promise<{ answer: string; wasCustom: boolean; index?: number; timedOut?: boolean } | null> {
-  return ctx.ui.custom<{ answer: string; wasCustom: boolean; index?: number; timedOut?: boolean } | null>((tui: Parameters<Parameters<ExtensionContext['ui']['custom']>[0]>[0], theme: Theme, _kb: unknown, done: (value: { answer: string; wasCustom: boolean; index?: number; timedOut?: boolean } | null) => void) => {
-    let optionIndex = 0
-    let editMode = false
-    const checked: boolean[] = allOptions.map(() => false)
-    let cachedLines: string[] | undefined
-    let cachedWidth: number | undefined
-
-    // deadline stays undefined for the whole overlay life when no timeout is
-    // configured, so every idle-timer branch below is a no-op in that case.
-    let deadline: number | undefined = timeoutMs !== undefined ? Date.now() + timeoutMs : undefined
-    let idleTimer: ReturnType<typeof setInterval> | undefined
-    let lastCountdown: number | undefined
-
-    function stopIdleTimer(): void {
-      if (idleTimer !== undefined) clearInterval(idleTimer)
-      idleTimer = undefined
+export async function askViaOverlay(specs: QuestionSpec[], ctx: ExtensionContext, timeoutMs?: number, events?: ExtensionAPI['events'], signal?: AbortSignal): Promise<FormResult | null> {
+  const saved: Array<Answer | undefined> = specs.map(() => undefined)
+  const lone = specs.length === 1
+  const batchId = lone ? undefined : randomUUID()
+  // One offer per question, made before the form opens and live until that question is settled.
+  const remotes: Array<RemoteQuestion | undefined> = specs.map(() => undefined)
+  let dispose = () => {
+    for (const remote of remotes) remote?.close()
+  }
+  try {
+    for (const [index, spec] of specs.entries()) {
+      if (signal?.aborted) return null
+      const offer = offerRemoteQuestion(spec, ctx, events, signal, batchId === undefined ? undefined : { id: batchId, index: index + 1, total: specs.length })
+      if (offer?.kind === 'claimed') remotes[index] = offer.remote
+      else if (offer?.value === null) return null
+      else saved[index] = offer?.value
     }
+    // Questions answered remotely during emission need no terminal.
+    if (saved.every(Boolean)) return { kind: 'submit', answers: saved }
+    let active = saved.indexOf(undefined)
 
-    /** Every exit path (an answer, a cancel, or the timeout itself) goes through
-     * here, so the interval can never outlive the overlay it belongs to. */
-    function finish(value: { answer: string; wasCustom: boolean; index?: number; timedOut?: boolean } | null): void {
-      stopIdleTimer()
-      // Closed before done, so a remote reply racing a local answer is rejected.
-      remote?.close()
-      done(value)
-    }
+    return await ctx.ui.custom<FormResult | null>((tui, theme, _kb, done) => {
+      const states = specs.map((spec): QuestionState => {
+        const common = { rows: questionRows(spec), cursor: 0, typing: false, draft: new Input({ prompt: '', placeholder: textRowLabel(spec.multiSelect), placeholderStyle: (text) => theme.fg('dim', text) }) }
+        return spec.multiSelect ? { ...common, mode: 'multi', checked: spec.options.map(() => false) } : { ...common, mode: 'single' }
+      })
+      saved.forEach((value, index) => {
+        if (value) restoreRemoteAnswer(index, value)
+      })
+      let reviewIndex = 0
+      let finished = false
+      let deadline = 0
+      let countdown: number | undefined
+      resetIdleTimer()
+      const timer = timeoutMs === undefined ? undefined : setInterval(idleTick, IDLE_TICK_MS)
 
-    function resetIdleTimer(): void {
-      if (timeoutMs === undefined) return
-      deadline = Date.now() + timeoutMs
-    }
-
-    remote?.attach(finish, resetIdleTimer)
-
-    function fireTimeout(): void {
-      // Claude: "submits any options you'd already selected". Single-select has
-      // nothing pre-committed (a selection only exists once Enter confirms it), so
-      // its timeout answer is empty rather than whatever option merely had focus.
-      const answer = multiSelect ? selectedLabels(allOptions, checked) : ''
-      finish({ answer, wasCustom: false, timedOut: true })
-    }
-
-    function idleTick(): void {
-      if (deadline === undefined) return
-      const remainingMs = deadline - Date.now()
-      if (remainingMs <= 0) {
-        fireTimeout()
-        return
+      function refresh(): void {
+        tui.requestRender()
       }
-      const remainingSeconds = Math.ceil(remainingMs / 1000)
-      const nextCountdown = remainingMs <= COUNTDOWN_WINDOW_MS ? remainingSeconds : undefined
-      if (nextCountdown !== lastCountdown) {
-        lastCountdown = nextCountdown
-        refresh()
+      function resetIdleTimer(): void {
+        deadline = Date.now() + (timeoutMs ?? 0)
       }
-    }
-
-    if (timeoutMs !== undefined) {
-      idleTimer = setInterval(idleTick, IDLE_TICK_MS)
-    }
-
-    const editorTheme: EditorTheme = {
-      borderColor: (s) => theme.fg('accent', s),
-      selectList: {
-        selectedPrefix: (t) => theme.fg('accent', t),
-        selectedText: (t) => theme.fg('accent', t),
-        description: (t) => theme.fg('muted', t),
-        scrollInfo: (t) => theme.fg('dim', t),
-        noMatch: (t) => theme.fg('warning', t),
-      },
-    }
-    const editor = new Editor(tui, editorTheme)
-
-    editor.onSubmit = (value) => {
-      const trimmed = value.trim()
-      if (trimmed) {
-        finish({ answer: trimmed, wasCustom: true })
-      } else {
-        editMode = false
-        editor.setText('')
-        refresh()
+      dispose = () => {
+        finished = true
+        clearInterval(timer)
+        for (const remote of remotes) remote?.close()
+        signal?.removeEventListener('abort', abort)
       }
-    }
-
-    function refresh() {
-      cachedLines = undefined
-      tui.requestRender()
-    }
-
-    function handleEditInput(data: string): void {
-      if (matchesKey(data, Key.escape)) {
-        editMode = false
-        editor.setText('')
-        refresh()
-        return
+      function finish(value: FormResult | null): void {
+        if (finished) return
+        dispose()
+        done(value)
       }
-      editor.handleInput(data)
-      refresh()
-    }
-
-    function confirmSelection(): void {
-      if (multiSelect) {
-        finish({ answer: selectedLabels(allOptions, checked), wasCustom: false })
-        return
-      }
-      const selected = allOptions[optionIndex]
-      if (selected.isOther) {
-        editMode = true
-        refresh()
-      } else {
-        finish({ answer: selected.label, wasCustom: false, index: optionIndex + 1 })
-      }
-    }
-
-    /** Moves the focus for an arrow key; false for any other key. */
-    function moveFocus(data: string): boolean {
-      if (matchesKey(data, Key.up)) {
-        optionIndex = Math.max(0, optionIndex - 1)
-      } else if (matchesKey(data, Key.down)) {
-        optionIndex = Math.min(allOptions.length - 1, optionIndex + 1)
-      } else {
-        return false
-      }
-      refresh()
-      return true
-    }
-
-    function handleSelectInput(data: string): void {
-      if (moveFocus(data)) return
-
-      if (multiSelect && data === ' ') {
-        checked[optionIndex] = !checked[optionIndex]
-        refresh()
-        return
-      }
-
-      if (matchesKey(data, Key.enter)) {
-        confirmSelection()
-        return
-      }
-
-      if (matchesKey(data, Key.escape)) {
+      function abort(): void {
         finish(null)
       }
-    }
+      /** A confirmed multi-select with nothing left checked and no text is unanswered. */
+      function confirmedAnswer(state: QuestionState): Answer | undefined {
+        return state.mode === 'multi' && !state.checked.some(Boolean) && !state.confirmed?.text ? undefined : state.confirmed
+      }
+      /** The confirmed answer, else what a multiSelect has filled in. As in Claude Code, single-select
+       * text is an answer only once Enter confirms it. */
+      function draftAnswer(state: QuestionState): Answer | undefined {
+        const confirmed = confirmedAnswer(state)
+        if (confirmed || state.mode === 'single') return confirmed
+        const text = settledText(state)
+        return state.checked.some(Boolean) || text ? multiAnswer(state.checked, text) : undefined
+      }
+      function answers(): Array<Answer | undefined> {
+        return states.map(draftAnswer)
+      }
+      /** The confirmed answer, else only the checked options and multiSelect text. */
+      function timeoutAnswer(state: QuestionState): Outcome {
+        const confirmed = confirmedAnswer(state)
+        if (confirmed) return confirmed
+        return state.mode === 'multi' ? { kind: 'timedOut', selected: multiAnswer(state.checked, state.draft.getValue().trim()) } : { kind: 'timedOut' }
+      }
+      function restoreRemoteAnswer(index: number, value: Answer): void {
+        const state = states[index]
+        confirm(state, value)
+        state.typing = false
+        switch (value.kind) {
+          case 'multi':
+            if (state.mode === 'multi') state.checked = state.checked.map((_, option) => value.indices.includes(option))
+            state.draft.setValue(value.text ?? '')
+            return
+          case 'text':
+            state.draft.setValue(value.text)
+            return
+          case 'option':
+            return
+          default:
+            unreachable(value)
+        }
+      }
+      function receive(index: number, value: QuestionAnswer): void {
+        if (finished) return
+        resetIdleTimer()
+        if (value === null) {
+          finish(null)
+          return
+        }
+        restoreRemoteAnswer(index, value)
+        // Text still being typed is not submitted from under the user: the form stays open.
+        if (answers().every(Boolean) && !unconfirmedText(states[active])) finish({ kind: 'submit', answers: answers() })
+        else if (index === active) navigate(active + 1)
+        else refresh()
+      }
+      /** As in Claude Code, entering a question focuses its first row, so a confirmed answer is
+       * told apart only by its tick and never by where the focus was left. */
+      function navigate(index: number): void {
+        // Claude Code ignores a step past either end: the question in view keeps its focus.
+        if (index === active) return
+        active = index
+        const state = states[index]
+        if (state) {
+          state.cursor = 0
+          state.typing = false
+        }
+        refresh()
+      }
+      function commit(value: Answer): void {
+        confirm(states[active], value)
+        remotes[active]?.close()
+        if (lone) finish({ kind: 'submit', answers: [value] })
+        else navigate(active + 1)
+      }
+      signal?.addEventListener('abort', abort, { once: true })
+      if (signal?.aborted) abort()
+      remotes.forEach((remote, index) => {
+        remote?.attach((value) => receive(index, value), resetIdleTimer)
+      })
+      function idleTick(): void {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+          finish({ kind: 'timeout', answers: states.map(timeoutAnswer) })
+          return
+        }
+        const next = remaining <= COUNTDOWN_WINDOW_MS ? Math.ceil(remaining / 1000) : undefined
+        if (next !== countdown) {
+          countdown = next
+          refresh()
+        }
+      }
+      function confirmSelection(state: QuestionState): void {
+        const row = state.rows[state.cursor]
+        if (row.kind === 'chat') finish({ kind: 'chat', answers: answers() })
+        else if (row.kind === 'text' && !state.typing) state.typing = true
+        else if (state.mode === 'multi') confirmChecked(state)
+        else confirmRow(state, row)
+      }
+      function confirmChecked(state: Extract<QuestionState, { mode: 'multi' }>): void {
+        const answer = multiAnswer(state.checked, state.draft.getValue().trim())
+        if (answer.indices.length > 0 || answer.text) commit(answer)
+        else if (!lone) {
+          // Nothing filled in leaves the question unanswered; a lone question has nowhere to advance.
+          state.confirmed = undefined
+          navigate(active + 1)
+        }
+      }
+      function confirmRow(state: QuestionState, row: Exclude<Row, { kind: 'chat' }>): void {
+        switch (row.kind) {
+          case 'text': {
+            const text = state.draft.getValue().trim()
+            if (text) commit({ kind: 'text', text })
+            return
+          }
+          case 'option':
+            commit({ kind: 'option', index: row.index })
+            return
+          default:
+            unreachable(row)
+        }
+      }
+      function moveFocus(state: QuestionState, data: string): boolean {
+        if (matchesKey(data, Key.up)) state.cursor = Math.max(0, state.cursor - 1)
+        else if (matchesKey(data, Key.down)) state.cursor = Math.min(state.rows.length - 1, state.cursor + 1)
+        else return false
+        state.typing = state.rows[state.cursor].kind === 'text'
+        refresh()
+        return true
+      }
+      function handleTypingInput(state: QuestionState, data: string): void {
+        if (matchesKey(data, Key.escape)) finish(null)
+        else if (matchesKey(data, Key.enter)) {
+          if (state.mode === 'single' && !state.draft.getValue().trim()) finish(null)
+          else confirmSelection(state)
+        } else if (!matchesKey(data, Key.tab) && !matchesKey(data, Key.shift('tab'))) {
+          state.draft.handleInput(data)
+          followEdits(state)
+        }
+      }
+      function handleQuestionInput(state: QuestionState, data: string): void {
+        if (moveFocus(state, data)) return
+        if (state.typing) handleTypingInput(state, data)
+        else if (matchesKey(data, Key.escape)) finish(null)
+        else if (matchesKey(data, Key.enter)) confirmSelection(state)
+        else if (data === ' ') toggleChecked(state)
+        refresh()
+      }
+      function navigateWithKey(data: string): boolean {
+        if (states[active]?.typing) return false
+        const next = matchesKey(data, Key.tab) || matchesKey(data, Key.right)
+        const previous = matchesKey(data, Key.shift('tab')) || matchesKey(data, Key.left)
+        if (!next && !previous) return false
+        navigate(previous ? Math.max(0, active - 1) : Math.min(specs.length, active + 1))
+        return true
+      }
+      function chooseReviewOption(): void {
+        finish(reviewIndex === 0 ? { kind: 'submit', answers: answers() } : null)
+      }
+      function handleReviewInput(data: string): void {
+        if (matchesKey(data, Key.up)) reviewIndex = 0
+        else if (matchesKey(data, Key.down)) reviewIndex = 1
+        else if (matchesKey(data, Key.enter)) chooseReviewOption()
+        else if (matchesKey(data, Key.escape)) finish(null)
+        refresh()
+      }
+      function handleInput(data: string): void {
+        if (finished) return
+        resetIdleTimer()
+        if (!lone && navigateWithKey(data)) return
+        const state = states[active]
+        if (state) handleQuestionInput(state, data)
+        else handleReviewInput(data)
+      }
 
-    function handleInput(data: string) {
-      // Claude: "Press any key to restart the timer." Every branch below returns
-      // through this function, so resetting unconditionally on entry covers all of
-      // them, including the ones (arrow keys, space) that never reach `finish`.
-      resetIdleTimer()
-
-      if (editMode) handleEditInput(data)
-      else handleSelectInput(data)
-    }
-
-    function render(width: number): string[] {
-      if (cachedLines && cachedWidth === width) return cachedLines
-      cachedWidth = width
-      cachedLines = buildQuestionLines({ width, question: params.question, header: shortHeader(params.header), options: allOptions, optionIndex, editMode, multiSelect, checked, editor, theme, countdownSeconds: lastCountdown })
-      return cachedLines
-    }
-
-    return {
-      render,
-      invalidate: () => {
-        cachedWidth = undefined
-        cachedLines = undefined
-      },
-      handleInput,
-      // Belt and suspenders alongside finish()'s own stopIdleTimer: if the host ever
-      // tears the overlay down through a path that does not go through `done`
-      // (finish's only caller), the interval still gets cleared here.
-      dispose: stopIdleTimer,
-    }
-  })
+      function textField(state: QuestionState, width: number): string {
+        const draft = state.draft.getValue()
+        state.draft.focused = state.typing
+        // The row's prefix and number take five columns, a checkbox four more, a confirmed tick two.
+        let reserved = 5
+        if (state.mode === 'multi') reserved = 9
+        else if (state.confirmed?.kind === 'text') reserved = 7
+        if (state.typing) return state.draft.render(Math.max(1, width - reserved))[0].trimEnd()
+        return draft ? theme.fg('text', draft) : theme.fg('dim', textRowLabel(state.mode === 'multi'))
+      }
+      function renderTabs(width: number, saved: Array<Answer | undefined>): string {
+        const tabs = specs.map((spec, index) => {
+          const name = spec.header ?? `Q${index + 1}`
+          return ` ${saved[index] ? '☒' : '☐'} ${name} `
+        })
+        tabs.push(' ✔ Submit ')
+        const widths = tabs.map((tab) => visibleWidth(tab))
+        const arrows = widths[active] + 4 <= width
+        const [first, last] = tabWindow(widths, active, arrows ? width - 4 : width)
+        const shown = tabs.slice(first, last + 1).map((tab, offset) => (first + offset === active ? theme.bg('selectedBg', theme.fg('text', tab)) : theme.fg('text', tab)))
+        return arrows ? `${theme.fg('dim', '←')} ${shown.join(' ')} ${theme.fg('dim', '→')}` : shown.join(' ')
+      }
+      function reviewBody(width: number, saved: Array<Answer | undefined>): string[] {
+        const lines = [` ${theme.bold('Review your answers')}`, '']
+        const item = (marker: string, text: string, color: 'text' | 'success') => {
+          const lead = Math.min(marker.length, width - 1)
+          wrapTextWithAnsi(text, Math.max(1, width - lead)).forEach((line, n) => {
+            lines.push((n === 0 ? theme.fg(color, marker.slice(0, lead)) : ' '.repeat(lead)) + theme.fg(color, line))
+          })
+        }
+        if (saved.includes(undefined)) lines.push(theme.fg('warning', ' ⚠ You have not answered all questions'), '')
+        specs.forEach((spec, index) => {
+          const answer = saved[index]
+          if (!answer) return
+          item(' ● ', spec.question, 'text')
+          item('   → ', answerText(spec, answer) || '(none)', 'success')
+        })
+        if (saved.some(Boolean)) lines.push('')
+        lines.push(theme.fg('muted', ' Ready to submit your answers?'), '', optionLine('Submit answers', 0, reviewIndex === 0, theme), optionLine('Cancel', 1, reviewIndex === 1, theme))
+        return lines
+      }
+      function render(width: number): string[] {
+        width = Math.max(1, width)
+        const state = states[active]
+        const spec = specs[active]
+        const saved = answers()
+        const rule = theme.fg('accent', '─'.repeat(width))
+        const lines = state ? buildQuestionLines({ width, question: theme.bold(spec.question), header: lone ? spec.header : undefined, state, field: textField(state, width), theme }) : [rule, ...reviewBody(width, saved)]
+        lines.push('', theme.fg('dim', navHint(spec?.multiSelect === true, !lone)))
+        if (countdown !== undefined) lines.push(theme.fg('warning', ` Auto-continuing in ${countdown}s if idle · press any key to stay`))
+        lines.push(rule)
+        // The tab bar sits inside the frame, under its top border.
+        if (!lone) lines.splice(1, 0, renderTabs(width, saved), '')
+        return lines.map((line) => truncateToWidth(line, width))
+      }
+      return {
+        render,
+        handleInput,
+        invalidate: () => {
+          for (const state of states) state.draft.invalidate()
+        },
+        dispose,
+      }
+    })
+  } finally {
+    dispose()
+  }
 }
 
 /** Dialog-primitive fallback for UI without a terminal (RPC mode supports
- * select/input/notify but not custom components). Mirrors the overlay's result
- * shape; a dismissed dialog reads as a cancel, same as Escape in the overlay. */
-async function askViaDialogs(params: QuestionSpec, ctx: ExtensionContext, allOptions: DisplayOption[], multiSelect: boolean): Promise<{ answer: string; wasCustom: boolean; index?: number; timedOut?: boolean } | null> {
-  const header = shortHeader(params.header)
-  const title = header ? `[${header}] ${params.question}` : params.question
+ * select/input/notify but not custom components). A dismissed dialog reads as a
+ * cancel, same as Escape in the overlay. */
+async function askViaDialogs(params: QuestionSpec, ctx: ExtensionContext): Promise<QuestionAnswer> {
+  const title = params.header ? `[${params.header}] ${params.question}` : params.question
   // Number the labels: ctx.ui.select returns the chosen label string, so duplicate
   // labels (or a model-supplied option named like the free-text entry) would be
   // ambiguous by text alone; the number is the unambiguous way back to the option.
-  const labels = allOptions.map((option, i) => `${i + 1}. ${option.label}`)
+  const labels = [...params.options.map((option) => option.label), ...(params.multiSelect ? [] : ['Type something.'])].map((label, i) => `${i + 1}. ${label}`)
   const choice = await ctx.ui.select(title, labels)
   if (choice === undefined) return null
   const index = labels.indexOf(choice)
-  const chosen = allOptions[index]
-  if (!multiSelect && chosen?.isOther === true) {
+  if (index === params.options.length) {
     const typed = await ctx.ui.input(params.question, 'Your answer')
     // A dismissed dialog cancels; a submitted empty answer is an (empty) answer, not a
     // cancel, so one accidental blank Enter does not abort the rest of a question batch.
     if (typed === undefined) return null
-    return { answer: typed.trim(), wasCustom: true }
+    return { kind: 'text', text: typed.trim() }
   }
-  const answer = chosen?.label ?? choice
-  return multiSelect ? { answer, wasCustom: false } : { answer, wasCustom: false, index: index + 1 }
+  // A choice outside the offered labels cannot name an option.
+  if (index < 0) return null
+  return params.multiSelect ? { kind: 'multi', indices: [index] } : { kind: 'option', index }
 }

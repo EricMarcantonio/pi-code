@@ -95,6 +95,7 @@
  */
 
 import * as os from 'node:os'
+import * as path from 'node:path'
 import { createLocalBashOperations, type ExtensionAPI, type ExtensionContext, SettingsManager, type ToolResultEvent, type UserBashEventResult } from '@earendil-works/pi-coding-agent'
 import { runningBackgroundAgents } from '../internal/background-agents.ts'
 import { claudeEffortLevel } from '../internal/effort.ts'
@@ -106,6 +107,7 @@ import { isPlanModeState, PLAN_MODE_CHANNEL } from '../internal/plan-mode-state.
 import { installedPlugins, managedForceEnabled } from '../internal/plugins.ts'
 import { approvalRecheck, isProjectApproved } from '../internal/project-approval.ts'
 import { checkoutRoot } from '../internal/project-root.ts'
+import { claudeSettingsSources } from '../internal/settings-chain.ts'
 import { watchSettingsFiles } from '../internal/settings-watch.ts'
 import { isSkillHooksEvent, SKILL_HOOKS_CHANNEL } from '../internal/skill-hooks.ts'
 import { isSubagentPhaseEvent, SUBAGENT_CHANNEL } from '../internal/subagent-events.ts'
@@ -209,14 +211,15 @@ function continueFalseReason(results: HookRunResult[]): string | undefined {
   return postToolStop ? (postToolStop.stopReason ?? 'Stopped by hook') : undefined
 }
 
-/** The first completed result's updatedToolOutput, as the pi output text. An MCP tool
- * also reads updatedMCPToolOutput. */
+/** The first completed result's hookSpecificOutput.updatedToolOutput, as the pi output
+ * text. As in Claude Code, the field is read there only, and an MCP tool falls back to
+ * updatedMCPToolOutput when updatedToolOutput is absent. */
 function updatedToolOutput(results: HookRunResult[], toolName: string, isMcp: boolean): string | undefined {
   return results
     .filter((result) => !result.timedOut)
     .map((result) => {
-      const parsed = tryParseJson(result.stdout)
-      const value = isMcp ? (parsed?.updatedMCPToolOutput ?? parsed?.updatedToolOutput) : parsed?.updatedToolOutput
+      const output = tryParseJson(result.stdout)?.hookSpecificOutput
+      const value = isMcp ? (output?.updatedToolOutput ?? output?.updatedMCPToolOutput) : output?.updatedToolOutput
       return value === undefined ? undefined : piToolOutput(toolName, value, isMcp)
     })
     .find((text) => text !== undefined)
@@ -253,6 +256,27 @@ function rewrittenUserBash(typed: string, rewritten: unknown, ctx: ExtensionCont
       exec: (command, cwd, options) => local.exec(command.endsWith(typed) ? `${command.slice(0, command.length - typed.length)}${rewritten}` : rewritten, cwd, options),
     },
   }
+}
+
+/** What each settings file stamps on its hooks. Every file gives its place in the chain
+ * as the dedup precedence (later files outrank earlier ones, managed hooks outrank them
+ * all, see keepOnce); a file listed twice keeps its later, higher place. A project or
+ * local settings hook also gets the checkout folder holding its `.claude` as
+ * CLAUDE_PROJECT_DIR, so `$CLAUDE_PROJECT_DIR/.claude/hooks/x.sh` in the repo root's
+ * settings.local.json still resolves from a subdirectory session. Claude passes the
+ * cwd there and the script is not found. A worktree's local file lives in the main
+ * checkout, and its hooks must still act on the worktree the session is in. */
+function settingsSourceStamps(cwd: string, home: string, trusted: boolean): Map<string, Pick<HookCommand, 'sourceRank' | 'projectDir'>> {
+  const stamps = new Map<string, Pick<HookCommand, 'sourceRank' | 'projectDir'>>()
+  for (const [index, source] of claudeSettingsSources(cwd, home, trusted).entries()) {
+    const stamp: Pick<HookCommand, 'sourceRank' | 'projectDir'> = { sourceRank: index + 1 }
+    if (source.scope === 'project' || source.scope === 'local') {
+      const dir = path.dirname(path.dirname(source.file))
+      stamp.projectDir = path.resolve(dir) === path.resolve(cwd) ? cwd : checkoutRoot(cwd)
+    }
+    stamps.set(source.file, stamp)
+  }
+  return stamps
 }
 
 export default function hooksExtension(pi: ExtensionAPI) {
@@ -359,7 +383,14 @@ export default function hooksExtension(pi: ExtensionAPI) {
     if (hook.type === 'prompt') return runPromptHook(hook, merged, resolveHookModel(ctx, hook.model), ms, ctx.modelRegistry)
     if (hook.type === 'agent') return runAgentHook(hook, merged, ms, (ctx.model as { id?: string } | undefined)?.id)
     if (hook.type === 'mcp_tool') return runMcpToolHook(hook, merged, ms)
-    return runHookCommand(hook.command, merged, ms, { projectDir, args: hook.args, onChild, shell: hook.shell, plugin: hook.pluginRoot !== undefined && hook.pluginDataDir !== undefined ? { root: hook.pluginRoot, dataDir: hook.pluginDataDir } : undefined, sessionId: merged.session_id as string | undefined })
+    return runHookCommand(hook.command, merged, ms, {
+      projectDir: hook.projectDir ?? projectDir,
+      args: hook.args,
+      onChild,
+      shell: hook.shell,
+      plugin: hook.pluginRoot !== undefined && hook.pluginDataDir !== undefined ? { root: hook.pluginRoot, dataDir: hook.pluginDataDir } : undefined,
+      sessionId: merged.session_id as string | undefined,
+    })
   }
   /** A runner bound to the firing context, filling the common fields into each
    * payload and dispatching on the entry's type. A background hook (see
@@ -522,6 +553,16 @@ export default function hooksExtension(pi: ExtensionAPI) {
       return
     }
     mergeNonManagedHooks(files)
+    stampSettingsSources(cwd, trusted)
+  }
+
+  function stampSettingsSources(cwd: string, trusted: boolean): void {
+    const stamps = settingsSourceStamps(cwd, os.homedir(), trusted)
+    for (const matcher of Object.values(config).flat()) {
+      const stamp = stamps.get(hookSources.get(matcher) ?? '')
+      if (stamp === undefined) continue
+      for (const hook of matcher.hooks ?? []) Object.assign(hook, stamp)
+    }
   }
 
   /** Merge the non-managed hook sources into the managed config resolveConfig loaded:
@@ -555,10 +596,9 @@ export default function hooksExtension(pi: ExtensionAPI) {
     registeredSkillHooks.length = 0
     spentOnce.clear()
     const trusted = await isProjectApproved(ctx)
-    // Claude's CLAUDE_PROJECT_DIR is the project root, not the session cwd; a hook
-    // referencing $CLAUDE_PROJECT_DIR/.claude/hooks/helper.sh must resolve from a
-    // subdirectory session too.
-    projectDir = checkoutRoot(ctx.cwd)
+    // Claude passes the launch directory as CLAUDE_PROJECT_DIR, and anchors `/`-rooted
+    // `if` paths there, even from a repo subdirectory.
+    projectDir = ctx.cwd
     resolveConfig(ctx.cwd, trusted)
     // Claude picks up direct settings edits mid-session via a file watcher. The reload
     // closes over the cwd value, never ctx: the poll has no awaiter, and every getter of
@@ -879,13 +919,18 @@ export default function hooksExtension(pi: ExtensionAPI) {
     const results = await runNotifyHooks(matchingCommands(config.PostCompact, trigger.names), payload, boundRunner(ctx))
     surfaceSystemMessages(results, (message) => ctx.ui.notify(message, 'warning'))
     // Claude also fires SessionStart with source "compact" when the session
-    // continues after compaction; its stdout context rides the next agent start,
-    // the same as any other SessionStart context.
+    // continues after compaction, and attaches its context right after the summary.
+    // A run that compacts midway never reaches before_agent_start, so the context is
+    // sent here: steered into a running agent, appended to the session when idle.
     const sessionStart = matchingCommands(config.SessionStart, 'compact')
     if (sessionStart.length > 0) {
       const startResults = await runNotifyHooks(sessionStart, { hook_event_name: 'SessionStart', source: 'compact' }, boundRunner(ctx))
       surfaceSystemMessages(startResults, (message) => ctx.ui.notify(message, 'warning'))
-      pendingSessionContext.push(...startResults.map((result) => promptContext(result.stdout)).filter(Boolean))
+      const content = startResults
+        .map((result) => promptContext(result.stdout))
+        .filter(Boolean)
+        .join('\n')
+      if (content) pi.sendMessage({ customType: 'claude-hook-context', content, display: false }, { deliverAs: 'steer' })
     }
   })
 

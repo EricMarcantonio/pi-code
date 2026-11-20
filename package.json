@@ -1,6 +1,6 @@
 {
   "name": "pi-code",
-  "version": "1.7.0",
+  "version": "1.10.1",
   "description": "Claude Code experience for the pi coding agent: reads your .claude config (rules, commands, skills, hooks, output styles, MCP servers, agents) and adds todo, checkpoints, memory, web, subagents, and goals",
   "keywords": [
     "pi",
@@ -69,7 +69,7 @@
     "@earendil-works/pi-ai": "^1.1.0",
     "@earendil-works/pi-coding-agent": "^1.1.0",
     "@earendil-works/pi-tui": "^1.1.0",
-    "@types/node": "^26.1.1",
+    "@types/node": "^22.19.21",
     "@vitest/coverage-v8": "^5.0.0",
     "fast-check": "^4.9.0",
     "knip": "^6.34.0",

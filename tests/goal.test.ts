@@ -287,6 +287,26 @@ describe('/goal command', () => {
 })
 
 describe('goal evaluation', () => {
+  // Claude Code sets no output cap on the evaluator, so it gets the model's own limit; a
+  // 512-token cap cut long quoted reasons off mid-JSON and left a met goal active (#460).
+  it('lets the evaluator answer up to the model output limit', async () => {
+    const t = setup({ model: { id: 'session-model', contextWindow: 200_000, maxTokens: 64_000 } })
+    await t.goal('done')
+    met('done')
+    await t.agentEnd()
+    expect(calls[0].options.maxTokens).toBe(64_000)
+  })
+
+  it('never sends an output cap of 0 for a model whose limit is unknown', async () => {
+    // pi gives a virtual model without a declared limit `maxTokens: 0`, meaning unknown; sent
+    // as a cap, the provider rejects every evaluation.
+    const t = setup({ model: { id: 'router/auto', contextWindow: 0, maxTokens: 0 } })
+    await t.goal('done')
+    met('done')
+    await t.agentEnd()
+    expect(calls[0].options.maxTokens).toBeGreaterThan(0)
+  })
+
   it('sends the transcript and condition to the evaluator with the stop-condition instructions', async () => {
     const t = setup({ branch: [messageEntry({ role: 'user', content: 'please make the auth tests pass' }), messageEntry(assistant('On it.'))] })
     await t.goal('all auth tests pass')

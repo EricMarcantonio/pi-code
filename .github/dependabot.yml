@@ -5,9 +5,14 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    # Version updates only; security updates are never delayed.
+    # Version updates wait 7 days; security updates are never delayed.
     cooldown:
-      semver-major-days: 7
+      default-days: 7
+    # @types/node follows the lowest supported Node (engines); a newer major would let code
+    # compile against APIs that runtime lacks, so majors move only with the engines floor.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       # A dependency joins the first group it matches, so the groups run from most to
       # least specific. The pi packages pin each other with caret ranges: a lone bump
@@ -15,6 +20,8 @@ updates:
       # moves as one set.
       pi:
         patterns: ["@earendil-works/*"]
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
       minor-and-patch:
         update-types: ["minor", "patch"]
       security:
@@ -25,6 +32,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # Version updates wait 7 days; security updates are never delayed.
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]

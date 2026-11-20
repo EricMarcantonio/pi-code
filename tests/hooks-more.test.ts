@@ -1,7 +1,7 @@
 import type { EventEmitter as Emitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { PassThrough } from 'node:stream'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -11,6 +11,7 @@ import { loadPluginHooks } from '../extensions/hooks/config.ts'
 import hooksExtension, { type HookRunner, interpretHookResult, isBackgroundHook, loadHooks, matchingCommands, runHookCommand, runPreToolUse, runPromptHook, runUserPromptSubmit, sessionEndTimeoutMs, timeoutMs } from '../extensions/hooks/index.ts'
 import { setAgentRunner } from '../extensions/internal/agent-run.ts'
 import { setBackgroundAgentCounter } from '../extensions/internal/background-agents.ts'
+import { setCliSettingsReader } from '../extensions/internal/cli-settings.ts'
 import { setManagedSettingsPath } from '../extensions/internal/managed-settings.ts'
 import { setMcpToolCaller } from '../extensions/internal/mcp-call.ts'
 import { setCompleteBackend } from '../extensions/internal/model-complete.ts'
@@ -618,6 +619,22 @@ describe('matchingCommands edge shapes', () => {
     expect(matchingCommands(entries, 'bash')).toEqual([{ command: 'guard.sh' }, { command: 'other.sh' }])
   })
 
+  it('runs the copy from the higher-ranked source with all its fields, at the position of the first copy', () => {
+    const entries = [
+      { matcher: 'Bash', hooks: [{ command: 'guard.sh', timeout: 5, sourceRank: 1 }, { command: 'other.sh' }] },
+      { matcher: '*', hooks: [{ command: 'guard.sh', timeout: 9, async: true, sourceRank: 2 }] },
+    ]
+    expect(matchingCommands(entries, 'bash')).toEqual([{ command: 'guard.sh', timeout: 9, async: true, sourceRank: 2 }, { command: 'other.sh' }])
+  })
+
+  it('keeps the copy from the higher-ranked source when a lower-ranked copy follows it', () => {
+    const entries = [
+      { matcher: 'Bash', hooks: [{ command: 'guard.sh', timeout: 5, sourceRank: Number.POSITIVE_INFINITY }] },
+      { matcher: '*', hooks: [{ command: 'guard.sh', async: true, projectDir: '/repo', sourceRank: 2 }] },
+    ]
+    expect(matchingCommands(entries, 'bash')).toEqual([{ command: 'guard.sh', timeout: 5, sourceRank: Number.POSITIVE_INFINITY }])
+  })
+
   it('keeps handlers that share a command but differ in args, if or input: they are not the same handler', () => {
     // Deduping on the command alone dropped the second of two exec-form hooks sharing an
     // interpreter, and of one guard registered under two `if` filters kept only the first:
@@ -734,6 +751,96 @@ describe('loadHooks malformed config shapes', () => {
       PreToolUse: [{ matcher: 'Bash', hooks: [{ command: 'p1' }] }],
       PostToolUse: [{ matcher: 'Bash', hooks: [{ command: 'q1' }] }],
     })
+  })
+})
+
+describe('plugin manifest hooks', () => {
+  /** A plugin root holding each named hooks file, every file registering one SessionStart command named after it. */
+  const pluginWith = (files: string[], hooks: unknown) => {
+    const root = tempDir('hooks-plugin-')
+    for (const file of files) {
+      mkdirSync(join(root, file, '..'), { recursive: true })
+      writeFileSync(join(root, file), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: 'command', command: `from-${file}` }] }] } }))
+    }
+    return { name: 'multi', root, dataDir: '/d', manifest: { hooks } }
+  }
+  const commands = (config: Record<string, { hooks: { command: string }[] }[]>): string[] =>
+    Object.values(config)
+      .flatMap((matchers) => matchers.flatMap((matcher) => matcher.hooks.map((hook) => hook.command)))
+      .sort()
+
+  it('should load every listed hooks file and inline object when the manifest declares an array', () => {
+    const plugin = pluginWith(['a.json', 'b.json'], ['./a.json', './b.json', { Stop: [{ hooks: [{ type: 'command', command: 'inline.sh' }] }] }])
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'a.json, b.json and the inline Stop entry each register their hook').toEqual(['from-a.json', 'from-b.json', 'inline.sh'])
+  })
+
+  it('should load hooks/hooks.json alongside the declared files when the manifest declares an array', () => {
+    const plugin = pluginWith(['hooks/hooks.json', 'extra.json'], ['./extra.json'])
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'the default file and the declared file both register').toEqual(['from-extra.json', 'from-hooks/hooks.json'])
+  })
+
+  it('should load hooks/hooks.json alongside the declared file when the manifest declares a single path', () => {
+    const plugin = pluginWith(['hooks/hooks.json', 'extra.json'], './extra.json')
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'the default file and the declared file both register').toEqual(['from-extra.json', 'from-hooks/hooks.json'])
+  })
+
+  it('should load hooks/hooks.json alongside the inline object when the manifest declares an object', () => {
+    const plugin = pluginWith(['hooks/hooks.json'], { Stop: [{ hooks: [{ type: 'command', command: 'inline.sh' }] }] })
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'the default file and the inline Stop entry both register').toEqual(['from-hooks/hooks.json', 'inline.sh'])
+  })
+
+  it('should load hooks/hooks.json when the manifest declares an empty array', () => {
+    const plugin = pluginWith(['hooks/hooks.json'], [])
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'the default file still registers').toEqual(['from-hooks/hooks.json'])
+  })
+
+  it('should load a file once when the manifest lists it twice or names the default file', () => {
+    const plugin = pluginWith(['hooks/hooks.json', 'a.json'], ['./a.json', 'a.json', './hooks/hooks.json'])
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'each file registers its hook exactly once').toEqual(['from-a.json', 'from-hooks/hooks.json'])
+  })
+
+  it('should load the remaining entries when a listed file is missing', () => {
+    const plugin = pluginWith(['a.json', 'c.json'], ['./a.json', './missing.json', './c.json'])
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'the files on both sides of the missing one register').toEqual(['from-a.json', 'from-c.json'])
+  })
+
+  it('should skip and warn about an entry when it is neither a path nor an object', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const plugin = pluginWith(['a.json'], [null, 42, true, ['./a.json'], './a.json'])
+    const config = {}
+
+    loadPluginHooks(config as never, [plugin] as never)
+
+    expect(commands(config), 'the valid path after the invalid entries still registers').toEqual(['from-a.json'])
+    expect(warn, 'each of the four invalid entries is reported').toHaveBeenCalledTimes(4)
   })
 })
 
@@ -879,11 +986,107 @@ describe('hooks extension session_start', () => {
     expect(options.env?.PATH).toBe(process.env.PATH)
   })
 
-  it('points CLAUDE_PROJECT_DIR at the worktree a session started in, not the main checkout', async () => {
-    // Claude: "the project root where the session started". repoRoot resolves a worktree to
-    // its main checkout, so `cd "$CLAUDE_PROJECT_DIR" && npm run format` acted on the user's
-    // main checkout from inside an isolated tree.
+  it('should set CLAUDE_PROJECT_DIR to the session cwd when the session starts in a repo subdirectory', async () => {
+    // Claude 2.1.322 passes the launch directory, not the repo root.
+    const repo = tempDir('hooks-repo-')
+    mkdirSync(join(repo, '.git'))
+    const sub = join(repo, 'packages', 'api')
+    mkdirSync(sub, { recursive: true })
+    writeSettings(hoisted.home, 'settings.json', homeConfig)
+
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: sub })
+    await ext.toolCall('bash', {})
+
+    const options = recordFor('home-pre').options as { env?: Record<string, string> }
+    expect(options.env?.CLAUDE_PROJECT_DIR, 'CLAUDE_PROJECT_DIR is the subdirectory the session started in').toBe(sub)
+  })
+
+  // Claude keeps settings.local.json in the cwd on Windows, so a repo-root or main-checkout file never loads there.
+  it.skipIf(process.platform === 'win32')('should give a repo-root settings.local.json hook the repo as CLAUDE_PROJECT_DIR when the session starts in a subdirectory', async () => {
+    const repo = tempDir('hooks-repo-')
+    mkdirSync(join(repo, '.git'))
+    const sub = join(repo, 'packages', 'api')
+    mkdirSync(sub, { recursive: true })
+    writeSettings(hoisted.home, 'settings.json', homeConfig)
+    writeSettings(repo, 'settings.local.json', { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: '"$CLAUDE_PROJECT_DIR/.claude/hooks/x.sh"' }] }] })
+
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: sub, isProjectTrusted: () => true, hasUI: true, ui: { confirm: async () => true } })
+    await ext.toolCall('bash', {}, 't1', { cwd: sub })
+
+    const local = recordFor('"$CLAUDE_PROJECT_DIR/.claude/hooks/x.sh"').options as { env?: Record<string, string> }
+    const user = recordFor('home-pre').options as { env?: Record<string, string> }
+    expect(local.env?.CLAUDE_PROJECT_DIR, 'the local settings hook gets the folder holding its .claude').toBe(repo)
+    expect(user.env?.CLAUDE_PROJECT_DIR, 'the user settings hook gets the session cwd').toBe(sub)
+  })
+
+  const scriptHook = '"$CLAUDE_PROJECT_DIR/.claude/hooks/x.sh"'
+  const trustedStart = { isProjectTrusted: () => true, hasUI: true, ui: { confirm: async () => true } }
+
+  it.skipIf(process.platform === 'win32')('should point a local settings hook at the worktree, not the main checkout, when the session starts at the worktree root', async () => {
+    // The worktree's settings.local.json lives in the main checkout, where `cd "$CLAUDE_PROJECT_DIR"` must not land.
     const { main, tree } = makeWorktree(tempDir('hooks-wt-'))
+    writeSettings(main, 'settings.local.json', { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: scriptHook }] }] })
+
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: tree, ...trustedStart })
+    await ext.toolCall('bash', {}, 't1', { cwd: tree })
+
+    const options = recordFor(scriptHook).options as { env?: Record<string, string> }
+    expect(options.env?.CLAUDE_PROJECT_DIR, 'CLAUDE_PROJECT_DIR is the worktree root').toBe(tree)
+  })
+
+  it.skipIf(process.platform === 'win32')('should point a local settings hook at the worktree root when the session starts in a worktree subdirectory', async () => {
+    const { main, tree } = makeWorktree(tempDir('hooks-wt-'))
+    const sub = join(tree, 'src')
+    mkdirSync(sub)
+    writeSettings(main, 'settings.local.json', { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: scriptHook }] }] })
+
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: sub, ...trustedStart })
+    await ext.toolCall('bash', {}, 't1', { cwd: sub })
+
+    const options = recordFor(scriptHook).options as { env?: Record<string, string> }
+    expect(options.env?.CLAUDE_PROJECT_DIR, 'CLAUDE_PROJECT_DIR is the worktree root').toBe(tree)
+  })
+
+  it.skipIf(process.platform === 'win32')('should run a handler declared in user and local settings once with the local projectDir when the session starts in a subdirectory', async () => {
+    const repo = tempDir('hooks-repo-')
+    mkdirSync(join(repo, '.git'))
+    const sub = join(repo, 'packages', 'api')
+    mkdirSync(sub, { recursive: true })
+    const config = { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: scriptHook }] }] }
+    writeSettings(hoisted.home, 'settings.json', config)
+    writeSettings(repo, 'settings.local.json', config)
+
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: sub, ...trustedStart })
+    await ext.toolCall('bash', {}, 't1', { cwd: sub })
+
+    expect(commandsRun(), 'the identical handler runs once').toEqual([scriptHook])
+    const options = recordFor(scriptHook).options as { env?: Record<string, string> }
+    expect(options.env?.CLAUDE_PROJECT_DIR, 'the run gets the local file folder').toBe(repo)
+  })
+
+  it('should anchor a /-rooted if path at the session cwd when the session starts in a repo subdirectory', async () => {
+    // Claude 2.1.322 runs an `Edit(/src/**)` hook for <cwd>/src, not <repo>/src.
+    const repo = tempDir('hooks-repo-')
+    mkdirSync(join(repo, '.git'))
+    const sub = join(repo, 'packages', 'api')
+    mkdirSync(sub, { recursive: true })
+    writeSettings(hoisted.home, 'settings.json', { PreToolUse: [{ hooks: [{ command: 'src-guard', if: 'Edit(/src/**)' }] }] })
+
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: sub })
+    await ext.toolCall('edit', { path: join(sub, 'src', 'a.ts') }, 't1', { cwd: sub })
+    expect(commandsRun(), 'a file under the subdirectory src/ matches /src/**').toEqual(['src-guard'])
+    await ext.toolCall('edit', { path: join(repo, 'src', 'a.ts') }, 't2', { cwd: sub })
+    expect(commandsRun(), 'a file under the repo root src/ does not match /src/**').toEqual(['src-guard'])
+  })
+
+  it('should set CLAUDE_PROJECT_DIR to the session cwd when the session starts inside a worktree subdirectory', async () => {
+    const { tree } = makeWorktree(tempDir('hooks-wt-'))
     mkdirSync(join(tree, 'src'))
     writeSettings(hoisted.home, 'settings.json', homeConfig)
 
@@ -892,8 +1095,7 @@ describe('hooks extension session_start', () => {
     await ext.toolCall('bash', {})
 
     const options = recordFor('home-pre').options as { env?: Record<string, string> }
-    expect(options.env?.CLAUDE_PROJECT_DIR).toBe(tree)
-    expect(options.env?.CLAUDE_PROJECT_DIR).not.toBe(main)
+    expect(options.env?.CLAUDE_PROJECT_DIR, 'CLAUDE_PROJECT_DIR is the cwd the session started in').toBe(join(tree, 'src'))
   })
 
   it('exports CLAUDE_CODE_SESSION_ID and CLAUDE_PID to hook commands', async () => {
@@ -1212,6 +1414,21 @@ describe('hooks extension tool_result (PostToolUse)', () => {
     return ext
   }
   const okText = [{ type: 'text', text: 'file.txt' }]
+
+  // Claude: "a PostToolUse hook with [a Bash matcher] doesn't run for Monitor".
+  it('does not run a Bash-matched PostToolUse hook for a monitor result, and runs a Monitor-matched one', async () => {
+    writeSettings(hoisted.home, 'settings.json', {
+      PostToolUse: [
+        { matcher: 'Bash', hooks: [{ command: 'post-bash' }] },
+        { matcher: 'Monitor', hooks: [{ command: 'post-monitor' }] },
+      ],
+    })
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: tempDir('hooks-proj-') })
+    await ext.toolResult('monitor', { input: { description: 'the watch', command: 'echo hi' }, content: okText })
+    expect(hoisted.calls.map((call) => call.command)).toEqual(['post-monitor'])
+    expect(JSON.parse(hoisted.calls[0].stdin)).toMatchObject({ hook_event_name: 'PostToolUse', tool_name: 'Monitor', tool_input: { description: 'the watch', command: 'echo hi' } })
+  })
 
   // Measured on Claude Code 2.1.295: a PostToolUse continue false stopped the run after
   // the tool had run, with no further model turn and no Stop hook.
@@ -2590,6 +2807,15 @@ describe('Claude vocabulary and decision-control conformance', () => {
     expect(input).toEqual({ path: '/proj/b.ts', edits: [{ oldText: 'x', newText: 'z' }] })
   })
 
+  it('keeps a bash call in the background when a hook rewrites its command', async () => {
+    const ext = await withHooks({ PreToolUse: [{ matcher: 'Bash', hooks: [{ command: 'rewrite' }] }] })
+    script('rewrite', { stdout: [JSON.stringify({ hookSpecificOutput: { updatedInput: { command: 'npm run dev -- --port 4000', run_in_background: true } } })], code: 0 })
+    const input: Record<string, unknown> = { command: 'npm run dev', run_in_background: true }
+    await ext.toolCall('bash', input)
+    expect(JSON.parse(recordFor('rewrite').stdin).tool_input).toEqual({ command: 'npm run dev', run_in_background: true })
+    expect(input).toEqual({ command: 'npm run dev -- --port 4000', run_in_background: true })
+  })
+
   it('keeps the original pi input when a translated rewrite is missing required fields', async () => {
     const ext = await withHooks({ PreToolUse: [{ hooks: [{ command: 'rewrite' }] }] })
     script('rewrite', { stdout: [JSON.stringify({ hookSpecificOutput: { updatedInput: { file_path: '/proj/b.ts' } } })], code: 0 })
@@ -2609,15 +2835,34 @@ describe('Claude vocabulary and decision-control conformance', () => {
   it('replaces the tool output the model sees via a schema-valid updatedToolOutput', async () => {
     // Claude: "Replaces the tool's output ... The value must match the tool's output shape."
     const ext = await withHooks({ PostToolUse: [{ hooks: [{ command: 'redact' }] }] })
-    script('redact', { stdout: [JSON.stringify({ updatedToolOutput: { stdout: '[redacted]', stderr: '', interrupted: false, isImage: false } })], code: 0 })
+    script('redact', { stdout: [JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', updatedToolOutput: { stdout: '[redacted]', stderr: '', interrupted: false, isImage: false } } })], code: 0 })
     const patch = (await ext.toolResult('bash', { input: { command: 'env' }, content: [{ type: 'text', text: 'SECRET=x' }] })) as { content: Array<{ type: string; text: string }> }
     expect(patch.content[0].text).toBe('[redacted]')
+  })
+
+  it('ignores an updatedToolOutput outside hookSpecificOutput, as Claude Code does', async () => {
+    const ext = await withHooks({ PostToolUse: [{ hooks: [{ command: 'redact' }] }] })
+    script('redact', { stdout: [JSON.stringify({ updatedToolOutput: { stdout: '[redacted]', stderr: '', interrupted: false, isImage: false } })], code: 0 })
+    const patch = await ext.toolResult('bash', { input: { command: 'env' }, content: [{ type: 'text', text: 'SECRET=x' }] })
+    expect(patch).toBeUndefined()
+  })
+
+  it('replaces an MCP tool output via updatedToolOutput, and via updatedMCPToolOutput only without it', async () => {
+    const ext = await withHooks({ PostToolUse: [{ hooks: [{ command: 'redact' }] }] })
+    ext.emitMcpTools([{ pi: 'github_create_issue', claude: 'mcp__github__create_issue' }])
+    const run = async (output: Record<string, unknown>) => {
+      script('redact', { stdout: [JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', ...output } })], code: 0 })
+      const patch = (await ext.toolResult('github_create_issue', { input: { title: 't' }, content: [{ type: 'text', text: 'SECRET=x' }] })) as { content: Array<{ type: string; text: string }> }
+      return patch.content[0].text
+    }
+    expect(await run({ updatedToolOutput: 'general', updatedMCPToolOutput: 'mcp only' })).toBe('general')
+    expect(await run({ updatedMCPToolOutput: 'mcp only' })).toBe('mcp only')
   })
 
   it('ignores a schema-mismatched updatedToolOutput and keeps the original output', async () => {
     // Claude: "a value that doesn't match the tool's output schema is ignored".
     const ext = await withHooks({ PostToolUse: [{ hooks: [{ command: 'redact' }] }] })
-    script('redact', { stdout: [JSON.stringify({ updatedToolOutput: 'just a string' })], code: 0 })
+    script('redact', { stdout: [JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', updatedToolOutput: 'just a string' } })], code: 0 })
     const patch = await ext.toolResult('bash', { input: { command: 'env' }, content: [{ type: 'text', text: 'SECRET=x' }] })
     expect(patch).toBeUndefined()
   })
@@ -2775,6 +3020,26 @@ describe('hooks polish: interrupts, timeout defaults, prompt-hook contract', () 
     expect(seenPrompt).toContain('"hook_event_name":"Stop"')
   })
 
+  it('lets a prompt hook answer up to the model output limit, as Claude Code sets no cap', async () => {
+    let seenMaxTokens: number | undefined
+    setCompleteBackend((async (_model: unknown, _context: unknown, options: { maxTokens?: number }) => {
+      seenMaxTokens = options.maxTokens
+      return { role: 'assistant', content: [{ type: 'text', text: '{"ok": true}' }], api: 'x', provider: 'x', model: 'm', usage: {}, stopReason: 'stop', timestamp: 0 }
+    }) as never)
+    await runPromptHook({ command: '', type: 'prompt', prompt: 'Should this stop?' }, { hook_event_name: 'Stop' }, { id: 'session-model', maxTokens: 64_000 } as never, 5000)
+    expect(seenMaxTokens).toBe(64_000)
+  })
+
+  it('never sends a prompt hook output cap of 0 for a model whose limit is unknown', async () => {
+    let seenMaxTokens: number | undefined
+    setCompleteBackend((async (_model: unknown, _context: unknown, options: { maxTokens?: number }) => {
+      seenMaxTokens = options.maxTokens
+      return { role: 'assistant', content: [{ type: 'text', text: '{"ok": true}' }], api: 'x', provider: 'x', model: 'm', usage: {}, stopReason: 'stop', timestamp: 0 }
+    }) as never)
+    await runPromptHook({ command: '', type: 'prompt', prompt: 'Should this stop?' }, { hook_event_name: 'Stop' }, { id: 'router/auto', maxTokens: 0 } as never, 5000)
+    expect(seenMaxTokens).toBeGreaterThan(0)
+  })
+
   it('reports a prompt hook that ran out of time as timed out, so the gated events fail closed', async () => {
     // The real backend answers a fired AbortSignal by resolving an aborted message with
     // no text. Read as an answer, that was exit 0 with empty stdout: a PreToolUse gate
@@ -2844,6 +3109,24 @@ describe('hooks extension SessionStart compact source', () => {
     expect(JSON.parse(recordFor('fresh-context').stdin)).toMatchObject({ hook_event_name: 'SessionStart', source: 'compact' })
   })
 
+  it('sends the compact SessionStart context at the compaction, not on the next agent start', async () => {
+    // Claude attaches the hook output right after the compact summary, so a run that
+    // continues past an automatic compaction reads it on its next request.
+    const ext = await withHooks({ SessionStart: [{ matcher: 'compact', hooks: [{ command: 'fresh-context' }, { command: 'more-context' }] }] })
+    script('fresh-context', { stdout: ['re-read the plan'], code: 0 })
+    script('more-context', { stdout: ['and the notes'], code: 0 })
+    await ext.compacted('threshold')
+
+    expect(ext.sent).toEqual([{ message: { customType: 'claude-hook-context', content: 're-read the plan\nand the notes', display: false }, options: { deliverAs: 'steer' } }])
+    await expect(ext.beforeAgentStart()).resolves.toBeUndefined()
+  })
+
+  it('sends nothing when the compact SessionStart hooks print no context', async () => {
+    const ext = await withHooks({ SessionStart: [{ matcher: 'compact', hooks: [{ command: 'fresh-context' }] }] })
+    await ext.compacted('threshold')
+    expect(ext.sent).toEqual([])
+  })
+
   it('does not fire compact-matched SessionStart hooks on a startup begin', async () => {
     const ext = await withHooks({ SessionStart: [{ matcher: 'compact', hooks: [{ command: 'fresh-context' }] }] })
     await ext.agentEnd()
@@ -2868,6 +3151,85 @@ describe('hooks extension dedup scope', () => {
 
     expect(commandsRun()).toEqual(['shared-format.sh', 'shared-format.sh'])
   })
+})
+
+describe('hooks extension dedup precedence', () => {
+  // Measured on Claude Code 2.1.325: among settings copies of one handler, the copy from
+  // the highest-precedence source runs, with its own async: user < project < local <
+  // --settings < managed.
+  const guard = 'dedup-guard.sh'
+  const trustedStart = { isProjectTrusted: () => true, hasUI: true, ui: { confirm: async () => true } }
+  type Source = 'user' | 'project' | 'local' | 'flag' | 'managed'
+
+  afterEach(() => {
+    setCliSettingsReader(undefined)
+  })
+
+  /** A repository with the session in a subdirectory, so only the root's local file has a
+   * CLAUDE_PROJECT_DIR of its own. */
+  const layout = (): { repo: string; sub: string } => {
+    const repo = tempDir('hooks-repo-')
+    mkdirSync(join(repo, '.git'))
+    const sub = join(repo, 'packages', 'api')
+    mkdirSync(sub, { recursive: true })
+    return { repo, sub }
+  }
+
+  const declare = (source: Source, dirs: { repo: string; sub: string }, fields: Record<string, unknown>): void => {
+    const hooks = { PreToolUse: [{ matcher: 'Bash', hooks: [{ command: guard, ...fields }] }] }
+    const files: Record<Source, string> = {
+      user: join(hoisted.home, '.claude', 'settings.json'),
+      project: join(dirs.sub, '.claude', 'settings.json'),
+      local: join(dirs.repo, '.claude', 'settings.local.json'),
+      flag: join(tempDir('hooks-flag-'), 'settings.json'),
+      managed: join(hoisted.home, 'managed-settings.json'),
+    }
+    mkdirSync(dirname(files[source]), { recursive: true })
+    writeFileSync(files[source], JSON.stringify({ hooks }))
+    if (source === 'flag') setCliSettingsReader(() => ({ settingsFile: files.flag, sources: new Set(['user', 'project', 'local'] as const), forwardArgs: [], errors: [] }))
+  }
+
+  /** Declares a blocking copy in one source and an async copy in the other, then makes a Bash call. */
+  const run = async (blocking: Source, background: Source) => {
+    const dirs = layout()
+    declare(blocking, dirs, {})
+    declare(background, dirs, { async: true })
+    script(guard, { code: 2, stderr: ['GUARD-BLOCK'] })
+    const ext = setupExtension()
+    await ext.sessionStart('startup', { cwd: dirs.sub, ...trustedStart })
+    const result = await ext.toolCall('bash', {}, 't1', { cwd: dirs.sub })
+    const options = recordFor(guard).options as { env?: Record<string, string> }
+    return { result, projectDir: options.env?.CLAUDE_PROJECT_DIR, ...dirs }
+  }
+
+  const pairs: Array<[Source, Source]> = [
+    ['user', 'project'],
+    ['project', 'local'],
+    ['local', 'flag'],
+    ['flag', 'managed'],
+    ['project', 'managed'],
+  ]
+  const needsRootLocalFile = (lower: Source, higher: Source): boolean => process.platform === 'win32' && (lower === 'local' || higher === 'local')
+  /** CLAUDE_PROJECT_DIR of the winning copy: the checkout root for the root's local file, else the session cwd. */
+  const ownProjectDir = (winner: Source, dirs: { repo: string; sub: string }): string => (winner === 'local' ? dirs.repo : dirs.sub)
+
+  for (const [lower, higher] of pairs) {
+    it.skipIf(needsRootLocalFile(lower, higher))(`should block the call when the blocking copy is in ${higher} settings and an async copy is in ${lower} settings`, async () => {
+      const ran = await run(higher, lower)
+
+      expect(ran.result, `the ${higher} copy blocks`).toEqual({ block: true, reason: 'GUARD-BLOCK' })
+      expect(commandsRun(), 'the handler runs once').toEqual([guard])
+      expect(ran.projectDir, `the ${higher} copy's own CLAUDE_PROJECT_DIR`).toBe(ownProjectDir(higher, ran))
+    })
+
+    it.skipIf(needsRootLocalFile(lower, higher))(`should not block the call when the async copy is in ${higher} settings and a blocking copy is in ${lower} settings`, async () => {
+      const ran = await run(lower, higher)
+
+      expect(ran.result, `the ${higher} async copy runs in the background`).toBeUndefined()
+      expect(commandsRun(), 'the handler runs once').toEqual([guard])
+      expect(ran.projectDir, `the ${higher} copy's own CLAUDE_PROJECT_DIR`).toBe(ownProjectDir(higher, ran))
+    })
+  }
 })
 
 describe('hooks from managed policy settings', () => {

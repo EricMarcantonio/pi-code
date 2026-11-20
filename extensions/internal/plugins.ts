@@ -10,6 +10,7 @@
  * installed_plugins.json records; without a usable record, the newest directory
  * not marked `.orphaned_at`, since an update leaves the old version in the cache
  * for a grace period and some directories are named by commit sha.
+ * A local marketplace's `./` entry loads from the marketplace itself, as in Claude Code.
  * The persistent data directory (${CLAUDE_PLUGIN_DATA}) survives updates at
  * ~/.claude/plugins/data/<id>, id being the qualified name folded to dashes.
  */
@@ -17,11 +18,14 @@
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import { getAgentDir } from '@earendil-works/pi-coding-agent'
+import { atomicWriteFile } from './atomic-write.ts'
+import { cliSettings } from './cli-settings.ts'
 import { claudeConfigDir } from './config-dir.ts'
 import { readManagedSettings } from './managed-settings.ts'
 import { userSettingsFiles } from './settings-chain.ts'
 import { statToken } from './stat-token.ts'
-import { errorMessage, isRecord } from './values.ts'
+import { errorMessage, isDirectory, isRecord, realpathOr } from './values.ts'
 
 export interface InstalledPlugin {
   name: string
@@ -37,7 +41,7 @@ export interface InstalledPlugin {
   userConfig?: Record<string, string>
 }
 
-function readJson(file: string): Record<string, unknown> {
+function readJson(file: string, decode: (raw: string) => string = (raw) => raw): Record<string, unknown> {
   let raw: string
   try {
     raw = fs.readFileSync(file, 'utf-8')
@@ -45,7 +49,7 @@ function readJson(file: string): Record<string, unknown> {
     return {} // no such file: nothing to read, and most callers expect that
   }
   try {
-    const parsed: unknown = JSON.parse(raw)
+    const parsed: unknown = JSON.parse(decode(raw))
     // isRecord, not a hand-written object check: a manifest or settings file that is a
     // JSON array is not a config object, and every caller here reads it by key.
     return isRecord(parsed) ? parsed : {}
@@ -136,6 +140,51 @@ function versionDir(pluginPath: string, recorded: string[] | undefined): string 
   return newest === undefined ? undefined : path.join(pluginPath, newest)
 }
 
+/** The root of each local marketplace in `plugins/known_marketplaces.json`: Claude records
+ * it as `installLocation` for a `directory` source and for a `file` one alike. */
+function localMarketplaceRoots(home: string): Map<string, string> {
+  const roots = new Map<string, string>()
+  for (const [name, entry] of Object.entries(readJson(path.join(claudeConfigDir(home), 'plugins', 'known_marketplaces.json')))) {
+    if (!isRecord(entry) || !isRecord(entry.source)) continue
+    const kind = entry.source.source
+    if ((kind === 'directory' || kind === 'file') && typeof entry.installLocation === 'string') roots.set(name, entry.installLocation)
+  }
+  return roots
+}
+
+const contains = (root: string, target: string): boolean => {
+  const relative = path.relative(root, target)
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+}
+
+/** Claude Code loads a local marketplace's `./` entry from the marketplace itself, not from
+ * the copy cached at install time. Undefined leaves the cache to decide (a remote source, which
+ * Claude does copy); null is a plugin that does not load: the marketplace is gone or no longer
+ * lists it, as Claude reports it failed or not found, or the entry leaves the marketplace
+ * directory, by its path or through a link, which Claude refuses. */
+function localPluginRoot(marketplaceRoot: string, directory: string): string | null | undefined {
+  const plugins = readJson(path.join(marketplaceRoot, '.claude-plugin', 'marketplace.json')).plugins
+  if (!Array.isArray(plugins)) return null
+  const entry: unknown = plugins.find((plugin) => isRecord(plugin) && plugin.name === directory)
+  if (!isRecord(entry)) return null
+  if (typeof entry.source !== 'string' || !entry.source.startsWith('./')) return undefined
+  const root = path.resolve(marketplaceRoot, entry.source)
+  // Resolving links catches both a climbing path and one that leaves through a link.
+  if (!contains(realpathOr(marketplaceRoot), realpathOr(root)) || !isDirectory(root)) return null
+  return root
+}
+
+/** The directory one installed plugin loads from: its local source, else its cached version.
+ * A live cached version is what says the plugin is installed at all: uninstalling leaves the
+ * source in place and only marks the cached copy orphaned. */
+function pluginRoot(cacheDir: string, marketplace: string, directory: string, installs: Map<string, string[]> | undefined, locals: Map<string, string>): string | undefined {
+  const cached = versionDir(path.join(cacheDir, marketplace, directory), installs?.get(`${directory}@${marketplace}`))
+  const local = locals.get(marketplace)
+  if (cached === undefined || local === undefined) return cached
+  const fromSource = localPluginRoot(local, directory)
+  return fromSource === undefined ? cached : (fromSource ?? undefined)
+}
+
 /** The enablement map, later files winning per key, as settings scopes merge. */
 function enabledMap(settingsFiles: string[]): Record<string, boolean> {
   const merged: Record<string, boolean> = {}
@@ -147,6 +196,45 @@ function enabledMap(settingsFiles: string[]): Record<string, boolean> {
     }
   }
   return merged
+}
+
+/** pi's own settings.json, whose `piCode.enabledPlugins` overrides Claude's enablement in pi
+ * only: Claude Code shares `~/.claude/settings.json` and never reads this file. */
+function piSettingsFile(): string {
+  return path.join(getAgentDir(), 'settings.json')
+}
+
+/** pi's settings reader strips a leading UTF-8 byte order mark before it parses, so a
+ * settings.json pi accepts can begin with one. */
+function stripBom(raw: string): string {
+  return raw.startsWith('\uFEFF') ? raw.slice(1) : raw
+}
+
+function piEnabledMap(): Record<string, boolean> {
+  const piCode = readJson(piSettingsFile(), stripBom).piCode
+  const entries = isRecord(piCode) && isRecord(piCode.enabledPlugins) ? piCode.enabledPlugins : {}
+  return Object.fromEntries(Object.entries(entries).filter(([, value]) => typeof value === 'boolean')) as Record<string, boolean>
+}
+
+/** The `enabledPlugins` maps that rank below managed settings, one per precedence level. */
+interface EnablementSettings {
+  /** The `--settings` flag's snapshot. */
+  flag: Record<string, boolean>
+  /** pi's own `piCode.enabledPlugins`. */
+  pi: Record<string, boolean>
+  /** The Claude user settings file, plus any extra user-controlled file a caller passes. */
+  claude: Record<string, boolean>
+}
+
+/** `settingsFiles` is the user-level chain, which holds the flag's snapshot when one was
+ * given; the snapshot is read apart because it ranks above pi's key and the rest below it. */
+function enablementSettings(settingsFiles: string[]): EnablementSettings {
+  const flagFile = cliSettings().settingsFile
+  return {
+    flag: flagFile === undefined ? {} : enabledMap([flagFile]),
+    pi: piEnabledMap(),
+    claude: enabledMap(settingsFiles.filter((file) => file !== flagFile)),
+  }
 }
 
 /** Copy one plugin config's `options` into `target`, coercing scalars to strings and
@@ -212,8 +300,8 @@ function contentToken(target: string): string {
  * so an in-place edit of it invalidates the cache. Costs a few stats where the full
  * walk reads and parses the settings and every manifest.
  */
-function pluginFingerprint(cacheDir: string, settingsFiles: string[], index: Map<string, string[]> | undefined): string {
-  const parts = settingsFiles.map(contentToken)
+function pluginFingerprint(cacheDir: string, settingsFiles: string[], index: Map<string, string[]> | undefined, locals: Map<string, string>): string {
+  const parts = [...settingsFiles.map(contentToken), JSON.stringify([...locals])]
   for (const marketplace of listDirs(cacheDir)) {
     const marketplaceDir = path.join(cacheDir, marketplace)
     parts.push(`${marketplace}:${statTokenOrMissing(marketplaceDir)}`)
@@ -226,8 +314,8 @@ function pluginFingerprint(cacheDir: string, settingsFiles: string[], index: Map
       }
       // resolvePlugin reads only the resolved version's manifest, so its stat token is
       // what an in-place edit (no directory entry changing) must move.
-      const resolved = versionDir(pluginPath, index?.get(`${pluginDir}@${marketplace}`))
-      if (resolved) parts.push(`${marketplace}/${pluginDir}/${path.basename(resolved)}/manifest:${statTokenOrMissing(path.join(resolved, '.claude-plugin', 'plugin.json'))}`)
+      const resolved = pluginRoot(cacheDir, marketplace, pluginDir, index, locals)
+      if (resolved) parts.push(`${marketplace}/${pluginDir}/${resolved}/manifest:${statTokenOrMissing(path.join(resolved, '.claude-plugin', 'plugin.json'))}`)
     }
   }
   return parts.join('\n')
@@ -249,17 +337,16 @@ export function installedPlugins(home: string, extraSettingsFiles: string[] = []
   const settingsFiles = [...userSettingsFiles(home), ...extraSettingsFiles]
   const key = [home, ...extraSettingsFiles].join('\n')
   const index = readInstallIndex(home)
-  const fingerprint = pluginFingerprint(cacheDir, settingsFiles, index)
+  const locals = localMarketplaceRoots(home)
+  const fingerprint = pluginFingerprint(cacheDir, [...settingsFiles, piSettingsFile()], index, locals)
   const cached = pluginCache.get(key)
   if (cached?.fingerprint === fingerprint) return cached.plugins
-  const enabled = enabledMap(settingsFiles)
+  const enabled = enablementSettings(settingsFiles)
   const configs = pluginConfigsMap(settingsFiles)
   const plugins: InstalledPlugin[] = []
-  for (const marketplace of listDirs(cacheDir)) {
-    for (const pluginDir of listPluginDirs(path.join(cacheDir, marketplace))) {
-      const plugin = resolvePlugin(home, cacheDir, marketplace, pluginDir, enabled, configs, index)
-      if (plugin) plugins.push(plugin)
-    }
+  for (const cached of cachedPlugins(cacheDir, index, locals)) {
+    const plugin = resolvePlugin(home, cached, enabled, configs)
+    if (plugin) plugins.push(plugin)
   }
   pluginCache.set(key, { fingerprint, plugins })
   return plugins
@@ -282,32 +369,107 @@ function enablementEntry(entries: unknown, qualified: string, directory: string)
   return record[qualified] ?? record[directory]
 }
 
-/** The plugin's effective enablement per Claude's precedence: a managed
- * enabledPlugins entry force-enables or blocks, then the user's setting, then the
- * manifest's defaultEnabled, which defaults to true ("starts in an enabled state
- * when the user has not set one"). */
-function pluginEnabled(qualified: string, pluginDir: string, enabled: Record<string, boolean>, manifest: Record<string, unknown>): boolean {
-  const managedState = enablementEntry(readManagedSettings().enabledPlugins, qualified, pluginDir)
-  if (typeof managedState === 'boolean') return managedState
-  const userState = enabled[qualified] ?? enabled[pluginDir]
-  if (typeof userState === 'boolean') return userState
-  return manifest.defaultEnabled !== false
+/** Which setting decided a plugin's enablement. */
+export type EnablementSource = 'managed' | 'flag' | 'pi' | 'claude' | 'default'
+
+interface Enablement {
+  enabled: boolean
+  decidedBy: EnablementSource
+  /** What the plugin's state would be without a `piCode.enabledPlugins` entry. */
+  withoutPi: boolean
 }
 
-/** Resolve one cached plugin directory into an enabled InstalledPlugin, or null to skip
- * it: turned off by managed/user settings or defaultEnabled, or no version yet. */
-function resolvePlugin(home: string, cacheDir: string, marketplace: string, pluginDir: string, enabled: Record<string, boolean>, configs: Record<string, Record<string, string>>, installs: Map<string, string[]> | undefined): InstalledPlugin | null {
-  const qualified = `${pluginDir}@${marketplace}`
-  const root = versionDir(path.join(cacheDir, marketplace, pluginDir), installs?.get(qualified))
-  if (!root) return null
-  const manifest = readJson(path.join(root, '.claude-plugin', 'plugin.json'))
-  if (!pluginEnabled(qualified, pluginDir, enabled, manifest)) return null
-  const name = typeof manifest.name === 'string' && manifest.name.length > 0 ? manifest.name : pluginDir
+/** The plugin's effective enablement per Claude's precedence: a managed
+ * enabledPlugins entry force-enables or blocks, then the `--settings` flag (Claude ranks
+ * the command line above every settings file), then pi's own override, then the user's
+ * setting, then the manifest's defaultEnabled, which defaults to true ("starts in an
+ * enabled state when the user has not set one"). */
+function pluginEnablement(qualified: string, pluginDir: string, enabled: EnablementSettings, manifest: Record<string, unknown>): Enablement {
+  const managedState = enablementEntry(readManagedSettings().enabledPlugins, qualified, pluginDir)
+  if (typeof managedState === 'boolean') return { enabled: managedState, decidedBy: 'managed', withoutPi: managedState }
+  const flagState = enablementEntry(enabled.flag, qualified, pluginDir)
+  if (typeof flagState === 'boolean') return { enabled: flagState, decidedBy: 'flag', withoutPi: flagState }
+  const userState = enablementEntry(enabled.claude, qualified, pluginDir)
+  const withoutPi = typeof userState === 'boolean' ? userState : manifest.defaultEnabled !== false
+  const piState = enablementEntry(enabled.pi, qualified, pluginDir)
+  if (typeof piState === 'boolean') return { enabled: piState, decidedBy: 'pi', withoutPi }
+  return { enabled: withoutPi, decidedBy: typeof userState === 'boolean' ? 'claude' : 'default', withoutPi }
+}
+
+/** One cached plugin's loadable version and manifest. */
+interface CachedPlugin {
+  qualified: string
+  directory: string
+  root: string
+  manifest: Record<string, unknown>
+  name: string
+}
+
+/** Every cached plugin that has a version to load, whatever its enablement. */
+function cachedPlugins(cacheDir: string, installs: Map<string, string[]> | undefined, locals: Map<string, string>): CachedPlugin[] {
+  const found: CachedPlugin[] = []
+  for (const marketplace of listDirs(cacheDir)) {
+    for (const directory of listPluginDirs(path.join(cacheDir, marketplace))) {
+      const qualified = `${directory}@${marketplace}`
+      const root = pluginRoot(cacheDir, marketplace, directory, installs, locals)
+      if (!root) continue
+      const manifest = readJson(path.join(root, '.claude-plugin', 'plugin.json'))
+      const name = typeof manifest.name === 'string' && manifest.name.length > 0 ? manifest.name : directory
+      found.push({ qualified, directory, root, manifest, name })
+    }
+  }
+  return found
+}
+
+/** Turn one cached plugin into an InstalledPlugin, or null to skip it: turned off by
+ * managed/user settings or defaultEnabled. */
+function resolvePlugin(home: string, { qualified, directory: pluginDir, root, manifest, name }: CachedPlugin, enabled: EnablementSettings, configs: Record<string, Record<string, string>>): InstalledPlugin | null {
+  if (!pluginEnablement(qualified, pluginDir, enabled, manifest).enabled) return null
   // Claude: "{id} is the plugin identifier with characters outside a-z, A-Z, 0-9,
   // _, and - replaced by -", one dash per character, underscores kept.
   const id = qualified.replace(/[^A-Za-z0-9_-]/g, '-')
   const userConfig = configs[qualified] ?? configs[pluginDir] ?? configs[name]
   return { name, root, dataDir: path.join(claudeConfigDir(home), 'plugins', 'data', id), manifest, enablementKeys: { qualified, directory: pluginDir }, ...(userConfig ? { userConfig } : {}) }
+}
+
+export interface PluginState extends Enablement {
+  /** `<directory>@<marketplace>`, the key `piCode.enabledPlugins` is written under. */
+  qualified: string
+  directory: string
+  name: string
+}
+
+/** Every cached plugin with a loadable version, enabled or not, and why. */
+export function pluginStates(home: string): PluginState[] {
+  const cacheDir = path.join(claudeConfigDir(home), 'plugins', 'cache')
+  const enabled = enablementSettings(userSettingsFiles(home))
+  return cachedPlugins(cacheDir, readInstallIndex(home), localMarketplaceRoots(home)).map(({ qualified, directory, name, manifest }) => ({ qualified, directory, name, ...pluginEnablement(qualified, directory, enabled, manifest) }))
+}
+
+/** Make `piCode.enabledPlugins` in pi's settings.json give the plugin the wanted state,
+ * keeping every other key. The qualified entry is written only when the bare-name entry, or
+ * Claude's settings without one, would not already give that state. Throws on a settings
+ * file that cannot be read or does not parse, which a rewrite would destroy. */
+export function setPiPluginEnabled(state: Pick<PluginState, 'qualified' | 'directory' | 'withoutPi'>, wanted: boolean): void {
+  const file = piSettingsFile()
+  let raw: string | undefined
+  try {
+    raw = fs.readFileSync(file, 'utf-8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  const parsed: unknown = raw === undefined ? {} : JSON.parse(stripBom(raw))
+  if (!isRecord(parsed)) throw new Error(`${file} is not a JSON object`)
+  const piCode = isRecord(parsed.piCode) ? parsed.piCode : {}
+  const entries = isRecord(piCode.enabledPlugins) ? { ...piCode.enabledPlugins } : {}
+  delete entries[state.qualified]
+  // The bare-name entry stays: it can also decide same-named plugins from other marketplaces.
+  const bare = entries[state.directory]
+  if ((typeof bare === 'boolean' ? bare : state.withoutPi) !== wanted) entries[state.qualified] = wanted
+  parsed.piCode = { ...piCode, enabledPlugins: entries }
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  // No lock is shared with pi's own settings writer, so a pi write that lands between the read above and this rename is lost.
+  atomicWriteFile(file, `${JSON.stringify(parsed, null, 2)}\n`)
 }
 
 /** A plugin component path, resolved inside the plugin root. Claude "rejects a component

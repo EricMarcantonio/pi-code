@@ -7,9 +7,9 @@
 import type { ToolCallEventResult } from '@earendil-works/pi-coding-agent'
 import type { PathAnchors } from '../internal/path-rules.ts'
 import { errorMessage, isRecord } from '../internal/values.ts'
-import { claudeToolInput, claudeToolName, piToolInput } from './claude-tools.ts'
-import type { HookCommand, HooksConfig } from './config.ts'
-import { allCommands, matchingCommands, passesIfFilter } from './matcher.ts'
+import { claudeToolInput, claudeToolName, monitorAsBashInput, piToolInput } from './claude-tools.ts'
+import type { HookCommand, HookMatcher, HooksConfig } from './config.ts'
+import { allCommands, handlerKey, matchingCommands, passesIfFilter } from './matcher.ts'
 import { type HookRunner, type HookRunResult, timeoutMs } from './runners.ts'
 
 export interface HookDecision {
@@ -35,14 +35,12 @@ export interface HookDecision {
  * arrives here as a parse failure and hookJsonError sorts it from a real error). */
 export function tryParseJson(text: string):
   | {
-      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string; additionalContext?: string; updatedInput?: unknown; suppressOriginalPrompt?: boolean }
+      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string; additionalContext?: string; updatedInput?: unknown; suppressOriginalPrompt?: boolean; updatedToolOutput?: unknown; updatedMCPToolOutput?: unknown }
       decision?: string
       reason?: string
       continue?: boolean
       stopReason?: string
       systemMessage?: string
-      updatedToolOutput?: unknown
-      updatedMCPToolOutput?: unknown
       ok?: boolean
     }
   | undefined {
@@ -58,7 +56,7 @@ export function tryParseJson(text: string):
 
 /** Top-level JSON output fields; a multi-line output where a line sets one of
  * these is a parse failure rather than plain text, as Claude documents. */
-const OUTPUT_FIELDS = new Set(['decision', 'reason', 'continue', 'stopReason', 'systemMessage', 'suppressOutput', 'hookSpecificOutput', 'updatedToolOutput', 'updatedMCPToolOutput', 'ok'])
+const OUTPUT_FIELDS = new Set(['decision', 'reason', 'continue', 'stopReason', 'systemMessage', 'suppressOutput', 'hookSpecificOutput', 'ok'])
 
 /** Claude reports a `<hook> hook error` notice when {..}-shaped stdout cannot be
  * read as JSON output, and does not treat that stdout as plain text. Returns the
@@ -224,6 +222,48 @@ function preToolContexts(results: HookRunResult[]): string[] {
   })
 }
 
+/** The hooks one PreToolUse payload goes to, and whether their updatedInput applies
+ * to the call. */
+interface PreToolPass {
+  commands: HookCommand[]
+  payload: Record<string, unknown>
+  rewrites: boolean
+}
+
+const BASH_NAMES = ['bash', 'Bash']
+
+/** Claude: "A PreToolUse or PermissionRequest hook with a Bash matcher also runs on
+ * shell commands Claude starts with the Monitor tool, but its allow and updatedInput
+ * have no effect on them", and "the hook gets a Bash call ... The hook doesn't run if
+ * its if names Monitor". A group whose matcher meets Monitor itself runs once, with
+ * the Monitor payload, and is left out here. Without this pass a `matcher: "Bash"`
+ * guard never saw a command started through monitor. */
+function monitorAsBashPass(matchers: HookMatcher[] | undefined, toolName: string, toolInput: unknown, monitorNames: readonly string[], anchors?: PathAnchors): PreToolPass | undefined {
+  if (toolName !== 'monitor') return undefined
+  const target = anchors ? { piName: BASH_NAMES[0], claudeName: BASH_NAMES[1], input: toolInput, anchors } : undefined
+  const commands = matchingCommands(matchers, BASH_NAMES, monitorNames).filter((command) => passesIfFilter(command, target))
+  return { commands, payload: { hook_event_name: 'PreToolUse', tool_name: BASH_NAMES[1], tool_input: monitorAsBashInput(toolInput) }, rewrites: false }
+}
+
+/** Claude runs a handler that both passes select once, as the Monitor call. The copy
+ * of the Bash pass runs instead only where it comes from a higher-precedence source:
+ * a repository's `async` copy under `*` must not unblock a managed `Bash` guard. */
+function oncePerCall(own: PreToolPass, asBash: PreToolPass): PreToolPass[] {
+  const ownByKey = new Map(own.commands.map((command) => [handlerKey(command), command]))
+  const outranked = new Set<HookCommand>()
+  const bashCommands = asBash.commands.filter((command) => {
+    const twin = ownByKey.get(handlerKey(command))
+    if (!twin) return true
+    if ((command.sourceRank ?? 0) <= (twin.sourceRank ?? 0)) return false
+    outranked.add(twin)
+    return true
+  })
+  return [
+    { ...own, commands: own.commands.filter((command) => !outranked.has(command)) },
+    { ...asBash, commands: bashCommands },
+  ]
+}
+
 /** Run PreToolUse hooks for a tool, in parallel as Claude does; the first blocking
  * verdict in config order wins. The payload reports the Claude vocabulary: the MCP
  * alias for MCP tools, and the documented name and tool_input shape for pi's
@@ -232,7 +272,8 @@ function preToolContexts(results: HookRunResult[]): string[] {
  * completes, translated back to the pi shape for a built-in (an incomplete rewrite
  * keeps the original input rather than corrupting it), so with several rewrites
  * the last to finish takes effect (the docs leave multi-rewrite ordering
- * unspecified). */
+ * unspecified). A monitor call is also offered to Bash-matched groups as a Bash
+ * call (see monitorAsBashPass). */
 export async function runPreToolUse(config: HooksConfig, toolName: string, toolInput: unknown, runner: HookRunner, claudeName?: string, onSystemMessage?: SystemMessageSink, anchors?: PathAnchors): Promise<PreToolUseOutcome> {
   const cwd = anchors?.cwd ?? process.cwd()
   const translatedName = claudeName ?? claudeToolName(toolName)
@@ -241,12 +282,18 @@ export async function runPreToolUse(config: HooksConfig, toolName: string, toolI
   const translatedInput = claudeName === undefined ? claudeToolInput(toolName, toolInput, cwd) : undefined
   const names = translatedName ? [toolName, translatedName] : [toolName]
   const target = anchors ? { piName: toolName, claudeName: translatedName, input: toolInput, anchors } : undefined
-  const commands = matchingCommands(config.PreToolUse, names).filter((command) => passesIfFilter(command, target))
-  const payload = { hook_event_name: 'PreToolUse', tool_name: translatedName ?? toolName, tool_input: translatedInput ?? toolInput }
+  const own: PreToolPass = {
+    commands: matchingCommands(config.PreToolUse, names).filter((command) => passesIfFilter(command, target)),
+    payload: { hook_event_name: 'PreToolUse', tool_name: translatedName ?? toolName, tool_input: translatedInput ?? toolInput },
+    rewrites: true,
+  }
+  const asBash = monitorAsBashPass(config.PreToolUse, toolName, toolInput, names, anchors)
+  const runs = (asBash ? oncePerCall(own, asBash) : [own]).flatMap((pass) => pass.commands.map((command) => ({ command, pass })))
+  const commands = runs.map((run) => run.command)
   const results = await Promise.all(
-    commands.map((command) =>
-      runner(command, payload, timeoutMs(command)).then((result) => {
-        applyUpdatedInput(toolName, toolInput, translatedInput !== undefined, result.stdout)
+    runs.map(({ command, pass }) =>
+      runner(command, pass.payload, timeoutMs(command)).then((result) => {
+        if (pass.rewrites) applyUpdatedInput(toolName, toolInput, translatedInput !== undefined, result.stdout)
         return result
       }),
     ),
